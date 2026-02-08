@@ -1,0 +1,680 @@
+"""
+Macro-Aware DGRCL v1.1 - Dynamic Graph Relation Contrastive Learning
+
+A Heterogeneous Graph Neural Network for market-neutral trading with:
+- Explicit Macro factor nodes (not feature vectors)
+- Dynamic Stock→Stock edge learning via attention
+- Hybrid Macro→Stock edges (fixed + learned)
+- Monte Carlo Dropout for epistemic uncertainty
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import softmax
+from typing import Dict, Tuple, Optional, List
+
+
+# =============================================================================
+# HETERO GRAPH BUILDER
+# =============================================================================
+
+class HeteroGraphBuilder:
+    """
+    Constructs PyG HeteroData from raw stock/macro tensors.
+    
+    Node Types:
+        - 'stock': N_s nodes with d_s=7 features
+        - 'macro': N_m nodes with d_m=4 features
+    
+    Edge Types:
+        - ('macro', 'influences', 'stock'): Hybrid (fixed + learned)
+        - ('stock', 'relates', 'stock'): Dynamic via attention
+    """
+    
+    def __init__(
+        self,
+        macro_stock_fixed_edges: Optional[torch.Tensor] = None,
+        sector_mapping: Optional[Dict[int, int]] = None
+    ):
+        """
+        Args:
+            macro_stock_fixed_edges: [2, E] tensor of fixed macro→stock edges
+            sector_mapping: Dict mapping stock_idx → sector_idx for fixed edges
+        """
+        self.macro_stock_fixed_edges = macro_stock_fixed_edges
+        self.sector_mapping = sector_mapping or {}
+    
+    def build(
+        self,
+        stock_features: torch.Tensor,  # [N_s, T, d_s]
+        macro_features: torch.Tensor,  # [N_m, T, d_m]
+        stock_stock_edges: Optional[torch.Tensor] = None,  # [2, E_ss]
+        macro_stock_learned_edges: Optional[torch.Tensor] = None,  # [2, E_ms]
+    ) -> HeteroData:
+        """
+        Build a HeteroData object for a single timestep.
+        
+        Returns:
+            HeteroData with proper node features and edge indices
+        """
+        data = HeteroData()
+        
+        # Node features
+        data['stock'].x = stock_features
+        data['stock'].num_nodes = stock_features.size(0)
+        
+        data['macro'].x = macro_features
+        data['macro'].num_nodes = macro_features.size(0)
+        
+        # Stock→Stock edges (dynamic, computed by DynamicGraphLearner)
+        if stock_stock_edges is not None:
+            data['stock', 'relates', 'stock'].edge_index = stock_stock_edges
+        
+        # Macro→Stock edges (hybrid: fixed + learned)
+        macro_stock_edges = self._build_macro_stock_edges(
+            macro_features.size(0),
+            stock_features.size(0),
+            macro_stock_learned_edges
+        )
+        if macro_stock_edges is not None:
+            data['macro', 'influences', 'stock'].edge_index = macro_stock_edges
+        
+        return data
+    
+    def _build_macro_stock_edges(
+        self,
+        num_macro: int,
+        num_stock: int,
+        learned_edges: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Combine fixed and learned macro→stock edges."""
+        edges_list = []
+        
+        if self.macro_stock_fixed_edges is not None:
+            edges_list.append(self.macro_stock_fixed_edges)
+        
+        if learned_edges is not None:
+            edges_list.append(learned_edges)
+        
+        # If no fixed edges defined, create default: all macros connect to all stocks
+        if len(edges_list) == 0:
+            src = torch.arange(num_macro).repeat_interleave(num_stock)
+            dst = torch.arange(num_stock).repeat(num_macro)
+            return torch.stack([src, dst], dim=0)
+        
+        return torch.cat(edges_list, dim=1) if edges_list else None
+
+
+# =============================================================================
+# TEMPORAL ENCODER
+# =============================================================================
+
+class TemporalEncoder(nn.Module):
+    """
+    Shared LSTM that projects raw time-series into latent embeddings.
+    
+    Input: [batch, T, F] where F is feature dimension
+    Output: [batch, H] where H is hidden dimension (last hidden state)
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        bidirectional: bool = False
+    ):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional
+        )
+        self.hidden_dim = hidden_dim * (2 if bidirectional else 1)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [N, T, F] time-series features
+        Returns:
+            h: [N, H] latent embeddings (last hidden state)
+        """
+        # LSTM output: (output, (h_n, c_n))
+        _, (h_n, _) = self.lstm(x)
+        
+        # h_n shape: [num_layers * num_directions, batch, hidden_size]
+        # Take the last layer's hidden state
+        if self.lstm.bidirectional:
+            # Concatenate forward and backward
+            h = torch.cat([h_n[-2], h_n[-1]], dim=-1)
+        else:
+            h = h_n[-1]
+        
+        return h
+
+
+# =============================================================================
+# DYNAMIC GRAPH LEARNER
+# =============================================================================
+
+class DynamicGraphLearner(nn.Module):
+    """
+    Computes dynamic adjacency matrix for Stock→Stock edges via attention.
+    
+    At each timestep, computes pairwise attention scores and keeps top-k
+    neighbors per node to maintain sparsity.
+    """
+    
+    def __init__(
+        self,
+        hidden_dim: int,
+        top_k: int = 10,
+        temperature: float = 1.0
+    ):
+        super().__init__()
+        self.top_k = top_k
+        self.temperature = temperature
+        
+        # Learnable projection for attention
+        self.W = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.a = nn.Parameter(torch.randn(2 * hidden_dim))
+        
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.W.weight)
+        nn.init.normal_(self.a, std=0.01)
+    
+    def forward(
+        self,
+        embeddings: torch.Tensor,  # [N, H]
+        return_weights: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Compute dynamic adjacency via attention.
+        
+        Args:
+            embeddings: [N, H] node embeddings
+            return_weights: Whether to return attention weights
+            
+        Returns:
+            edge_index: [2, E] sparse edge indices (top-k per node)
+            edge_weight: [E] attention weights (if return_weights=True)
+        """
+        N = embeddings.size(0)
+        
+        # Project embeddings
+        h = self.W(embeddings)  # [N, H]
+        
+        # Compute pairwise attention scores
+        # a^T [W h_i || W h_j] for all pairs
+        h_repeat = h.unsqueeze(1).repeat(1, N, 1)  # [N, N, H]
+        h_repeat_t = h.unsqueeze(0).repeat(N, 1, 1)  # [N, N, H]
+        
+        concat = torch.cat([h_repeat, h_repeat_t], dim=-1)  # [N, N, 2H]
+        attention = F.leaky_relu(torch.matmul(concat, self.a), negative_slope=0.2)  # [N, N]
+        attention = attention / self.temperature
+        
+        # Top-k selection per row (each node keeps top-k neighbors)
+        k = min(self.top_k, N - 1)
+        topk_values, topk_indices = torch.topk(attention, k=k, dim=1)  # [N, k]
+        
+        # Build sparse edge_index
+        src = torch.arange(N, device=embeddings.device).unsqueeze(1).repeat(1, k)  # [N, k]
+        dst = topk_indices  # [N, k]
+        
+        edge_index = torch.stack([src.flatten(), dst.flatten()], dim=0)  # [2, N*k]
+        
+        if return_weights:
+            # Normalize weights via softmax over selected neighbors
+            edge_weight = F.softmax(topk_values, dim=1).flatten()  # [N*k]
+            return edge_index, edge_weight
+        
+        return edge_index, None
+
+
+# =============================================================================
+# MACRO PROPAGATION LAYER
+# =============================================================================
+
+class MacroPropagation(MessagePassing):
+    """
+    Custom message passing layer where Stock nodes aggregate messages from:
+    1. Top-k similar Stock neighbors (dynamic edges)
+    2. Connected Macro nodes (hybrid edges)
+    
+    Equation:
+        h'_i = σ(Σ_{j ∈ N_s(i)} α_ij W_s h_j + Σ_{m ∈ N_m(i)} β_im W_m h_m)
+    
+    This is NOT a standard GATConv - it implements dual aggregation with
+    separate transformations for stock and macro messages.
+    """
+    
+    def __init__(
+        self,
+        stock_dim: int,
+        macro_dim: int,
+        out_dim: int,
+        heads: int = 4,
+        dropout: float = 0.1,
+        negative_slope: float = 0.2
+    ):
+        super().__init__(aggr='add', node_dim=0)
+        
+        self.stock_dim = stock_dim
+        self.macro_dim = macro_dim
+        self.out_dim = out_dim
+        self.heads = heads
+        self.negative_slope = negative_slope
+        self.dropout = dropout
+        
+        # Separate transformations for stock and macro
+        self.W_stock = nn.Linear(stock_dim, heads * out_dim, bias=False)
+        self.W_macro = nn.Linear(macro_dim, heads * out_dim, bias=False)
+        
+        # Attention parameters for stock-stock
+        self.att_stock = nn.Parameter(torch.randn(1, heads, 2 * out_dim))
+        
+        # Attention parameters for macro-stock
+        self.att_macro = nn.Parameter(torch.randn(1, heads, 2 * out_dim))
+        
+        # Output projection
+        self.out_proj = nn.Linear(heads * out_dim, out_dim)
+        
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.W_stock.weight)
+        nn.init.xavier_uniform_(self.W_macro.weight)
+        nn.init.xavier_uniform_(self.att_stock)
+        nn.init.xavier_uniform_(self.att_macro)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+    
+    def forward(
+        self,
+        stock_h: torch.Tensor,  # [N_s, H_s]
+        macro_h: torch.Tensor,  # [N_m, H_m]
+        stock_stock_edge_index: torch.Tensor,  # [2, E_ss]
+        macro_stock_edge_index: torch.Tensor,  # [2, E_ms]
+        stock_stock_edge_weight: Optional[torch.Tensor] = None,  # [E_ss]
+    ) -> torch.Tensor:
+        """
+        Dual aggregation from stock and macro neighbors.
+        
+        Returns:
+            Updated stock embeddings [N_s, out_dim]
+        """
+        N_s = stock_h.size(0)
+        H = self.heads
+        D = self.out_dim
+        
+        # Transform stock embeddings
+        stock_h_transformed = self.W_stock(stock_h).view(-1, H, D)  # [N_s, H, D]
+        
+        # Transform macro embeddings
+        macro_h_transformed = self.W_macro(macro_h).view(-1, H, D)  # [N_m, H, D]
+        
+        # 1. Stock-Stock aggregation
+        stock_agg = self._aggregate_stock(
+            stock_h_transformed,
+            stock_stock_edge_index,
+            stock_stock_edge_weight
+        )  # [N_s, H, D]
+        
+        # 2. Macro-Stock aggregation
+        macro_agg = self._aggregate_macro(
+            stock_h_transformed,
+            macro_h_transformed,
+            macro_stock_edge_index
+        )  # [N_s, H, D]
+        
+        # Combine aggregations
+        out = stock_agg + macro_agg  # [N_s, H, D]
+        out = out.view(-1, H * D)  # [N_s, H*D]
+        out = self.out_proj(out)  # [N_s, out_dim]
+        out = F.elu(out)
+        
+        return out
+    
+    def _aggregate_stock(
+        self,
+        h: torch.Tensor,  # [N_s, H, D]
+        edge_index: torch.Tensor,
+        edge_weight: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Aggregate messages from stock neighbors."""
+        src, dst = edge_index
+        
+        # Compute attention
+        h_i = h[dst]  # [E, H, D]
+        h_j = h[src]  # [E, H, D]
+        
+        concat = torch.cat([h_i, h_j], dim=-1)  # [E, H, 2D]
+        alpha = (concat * self.att_stock).sum(dim=-1)  # [E, H]
+        alpha = F.leaky_relu(alpha, negative_slope=self.negative_slope)
+        
+        # Normalize via softmax over incoming edges
+        alpha = softmax(alpha, dst, num_nodes=h.size(0))  # [E, H]
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        
+        # Incorporate precomputed edge weights if available
+        if edge_weight is not None:
+            alpha = alpha * edge_weight.unsqueeze(-1)  # [E, H]
+        
+        # Aggregate
+        out = h_j * alpha.unsqueeze(-1)  # [E, H, D]
+        out = torch.zeros_like(h).scatter_add_(0, dst.view(-1, 1, 1).expand_as(out), out)
+        
+        return out
+    
+    def _aggregate_macro(
+        self,
+        stock_h: torch.Tensor,  # [N_s, H, D]
+        macro_h: torch.Tensor,  # [N_m, H, D]
+        edge_index: torch.Tensor  # [2, E_ms] where src=macro, dst=stock
+    ) -> torch.Tensor:
+        """Aggregate messages from macro neighbors."""
+        src, dst = edge_index  # src: macro indices, dst: stock indices
+        
+        # Get embeddings
+        h_stock = stock_h[dst]  # [E, H, D]
+        h_macro = macro_h[src]  # [E, H, D]
+        
+        # Compute attention β_im
+        concat = torch.cat([h_stock, h_macro], dim=-1)  # [E, H, 2D]
+        beta = (concat * self.att_macro).sum(dim=-1)  # [E, H]
+        beta = F.leaky_relu(beta, negative_slope=self.negative_slope)
+        
+        # Normalize via softmax over macro neighbors per stock
+        beta = softmax(beta, dst, num_nodes=stock_h.size(0))  # [E, H]
+        beta = F.dropout(beta, p=self.dropout, training=self.training)
+        
+        # Aggregate macro messages to stock nodes
+        out = h_macro * beta.unsqueeze(-1)  # [E, H, D]
+        out = torch.zeros_like(stock_h).scatter_add_(
+            0, dst.view(-1, 1, 1).expand_as(out), out
+        )
+        
+        return out
+
+
+# =============================================================================
+# MC DROPOUT HEAD
+# =============================================================================
+
+class MCDropoutHead(nn.Module):
+    """
+    Output head with Monte Carlo Dropout for epistemic uncertainty estimation.
+    
+    At inference, use force_dropout=True to enable stochastic passes.
+    Multiple forward passes yield μ (mean prediction) and σ² (variance).
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 64,
+        output_dim: int = 1,
+        dropout: float = 0.3
+    ):
+        super().__init__()
+        self.dropout = dropout
+        
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        force_dropout: bool = False
+    ) -> torch.Tensor:
+        """
+        Forward pass with optional forced dropout.
+        
+        Args:
+            x: [N, input_dim] embeddings
+            force_dropout: If True, apply dropout even in eval mode
+            
+        Returns:
+            scores: [N, output_dim] ranking scores
+        """
+        if force_dropout:
+            # Force dropout on regardless of training mode
+            return self._forward_with_dropout(x)
+        return self.layers(x)
+    
+    def _forward_with_dropout(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply dropout layers manually."""
+        h = x
+        for layer in self.layers:
+            if isinstance(layer, nn.Dropout):
+                h = F.dropout(h, p=self.dropout, training=True)
+            else:
+                h = layer(h)
+        return h
+    
+    def mc_forward(
+        self,
+        x: torch.Tensor,
+        n_samples: int = 30
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Monte Carlo forward passes for uncertainty estimation.
+        
+        Args:
+            x: [N, input_dim] embeddings
+            n_samples: Number of stochastic forward passes
+            
+        Returns:
+            mu: [N, output_dim] mean predictions
+            sigma2: [N, output_dim] variance (epistemic uncertainty)
+        """
+        outputs = torch.stack([
+            self.forward(x, force_dropout=True) for _ in range(n_samples)
+        ], dim=0)  # [K, N, output_dim]
+        
+        mu = outputs.mean(dim=0)
+        sigma2 = outputs.var(dim=0)
+        
+        return mu, sigma2
+
+
+# =============================================================================
+# MACRO DGRCL - MAIN MODEL
+# =============================================================================
+
+class MacroDGRCL(nn.Module):
+    """
+    Macro-Aware Dynamic Graph Relation Contrastive Learning Model.
+    
+    Architecture:
+        1. TemporalEncoder: LSTM projects time-series → embeddings
+        2. DynamicGraphLearner: Computes dynamic Stock→Stock adjacency
+        3. MacroPropagation: Custom message passing with dual aggregation
+        4. MCDropoutHead: Ranking scores with uncertainty estimation
+    
+    Forward returns both ranking scores and embeddings for contrastive loss.
+    """
+    
+    def __init__(
+        self,
+        num_stocks: int,
+        num_macros: int,
+        stock_feature_dim: int = 7,
+        macro_feature_dim: int = 4,
+        hidden_dim: int = 64,
+        temporal_layers: int = 2,
+        mp_layers: int = 2,
+        heads: int = 4,
+        top_k: int = 10,
+        dropout: float = 0.1,
+        mc_dropout: float = 0.3
+    ):
+        super().__init__()
+        
+        self.num_stocks = num_stocks
+        self.num_macros = num_macros
+        self.hidden_dim = hidden_dim
+        
+        # Temporal Encoders (separate for stock and macro due to different dims)
+        self.stock_encoder = TemporalEncoder(
+            input_dim=stock_feature_dim,
+            hidden_dim=hidden_dim,
+            num_layers=temporal_layers,
+            dropout=dropout
+        )
+        self.macro_encoder = TemporalEncoder(
+            input_dim=macro_feature_dim,
+            hidden_dim=hidden_dim,
+            num_layers=temporal_layers,
+            dropout=dropout
+        )
+        
+        # Dynamic Graph Learner
+        self.graph_learner = DynamicGraphLearner(
+            hidden_dim=hidden_dim,
+            top_k=top_k
+        )
+        
+        # Message Passing Layers
+        self.mp_layers = nn.ModuleList([
+            MacroPropagation(
+                stock_dim=hidden_dim,
+                macro_dim=hidden_dim,
+                out_dim=hidden_dim,
+                heads=heads,
+                dropout=dropout
+            )
+            for _ in range(mp_layers)
+        ])
+        
+        # Layer normalization
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(mp_layers)
+        ])
+        
+        # MC Dropout Head
+        self.output_head = MCDropoutHead(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            output_dim=1,
+            dropout=mc_dropout
+        )
+        
+        # Graph builder
+        self.graph_builder = HeteroGraphBuilder()
+    
+    def forward(
+        self,
+        stock_features: torch.Tensor,  # [N_s, T, d_s]
+        macro_features: torch.Tensor,  # [N_m, T, d_m]
+        macro_stock_edges: Optional[torch.Tensor] = None,  # [2, E_ms]
+        force_dropout: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass.
+        
+        Args:
+            stock_features: [N_s, T, d_s] stock time-series
+            macro_features: [N_m, T, d_m] macro time-series
+            macro_stock_edges: [2, E_ms] macro→stock edge index
+            force_dropout: Enable MC Dropout for uncertainty
+            
+        Returns:
+            scores: [N_s, 1] ranking scores
+            embeddings: [N_s, H] final embeddings for contrastive loss
+        """
+        # 1. Temporal Encoding
+        stock_h = self.stock_encoder(stock_features)  # [N_s, H]
+        macro_h = self.macro_encoder(macro_features)  # [N_m, H]
+        
+        # 2. Dynamic Graph Learning (Stock→Stock)
+        stock_stock_edges, edge_weights = self.graph_learner(
+            stock_h, return_weights=True
+        )
+        
+        # 3. Build Macro→Stock edges if not provided
+        if macro_stock_edges is None:
+            # Default: all macros connect to all stocks
+            N_m, N_s = macro_features.size(0), stock_features.size(0)
+            src = torch.arange(N_m, device=stock_features.device).repeat_interleave(N_s)
+            dst = torch.arange(N_s, device=stock_features.device).repeat(N_m)
+            macro_stock_edges = torch.stack([src, dst], dim=0)
+        
+        # 4. Message Passing
+        h = stock_h
+        for i, (mp_layer, ln) in enumerate(zip(self.mp_layers, self.layer_norms)):
+            h_new = mp_layer(
+                stock_h=h,
+                macro_h=macro_h,
+                stock_stock_edge_index=stock_stock_edges,
+                macro_stock_edge_index=macro_stock_edges,
+                stock_stock_edge_weight=edge_weights
+            )
+            # Residual connection + LayerNorm
+            h = ln(h + h_new)
+        
+        # 5. Output head with optional MC Dropout
+        scores = self.output_head(h, force_dropout=force_dropout)
+        
+        return scores, h
+    
+    def predict_with_uncertainty(
+        self,
+        stock_features: torch.Tensor,
+        macro_features: torch.Tensor,
+        macro_stock_edges: Optional[torch.Tensor] = None,
+        n_samples: int = 30
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Inference with epistemic uncertainty via MC Dropout.
+        
+        Returns:
+            mu: [N_s, 1] mean predictions
+            sigma2: [N_s, 1] variance (uncertainty)
+            embeddings: [N_s, H] final embeddings
+        """
+        # Get embeddings (deterministic)
+        with torch.no_grad():
+            stock_h = self.stock_encoder(stock_features)
+            macro_h = self.macro_encoder(macro_features)
+            
+            stock_stock_edges, edge_weights = self.graph_learner(
+                stock_h, return_weights=True
+            )
+            
+            if macro_stock_edges is None:
+                N_m, N_s = macro_features.size(0), stock_features.size(0)
+                src = torch.arange(N_m, device=stock_features.device).repeat_interleave(N_s)
+                dst = torch.arange(N_s, device=stock_features.device).repeat(N_m)
+                macro_stock_edges = torch.stack([src, dst], dim=0)
+            
+            h = stock_h
+            for mp_layer, ln in zip(self.mp_layers, self.layer_norms):
+                h_new = mp_layer(
+                    stock_h=h,
+                    macro_h=macro_h,
+                    stock_stock_edge_index=stock_stock_edges,
+                    macro_stock_edge_index=macro_stock_edges,
+                    stock_stock_edge_weight=edge_weights
+                )
+                h = ln(h + h_new)
+        
+        # MC Dropout sampling
+        mu, sigma2 = self.output_head.mc_forward(h, n_samples=n_samples)
+        
+        return mu, sigma2, h
