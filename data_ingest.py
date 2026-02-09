@@ -6,7 +6,7 @@ import torch
 from datetime import datetime, timedelta
 
 # --- Configuration ---
-START_DATE = (datetime.now() - timedelta(days=365*3)).strftime('%Y-%m-%d')
+START_DATE = "2020-01-01"  # Capture COVID crash + recovery + bear market + recent volatility
 END_DATE = datetime.now().strftime('%Y-%m-%d')
 DATA_DIR = "./data"
 PROCESSED_DIR = "./data/processed"
@@ -64,7 +64,14 @@ def rolling_zscore_normalize(df, window=60):
 # --- Main Execution ---
 def fetch_sp500_tickers():
     print("Scraping S&P 500 tickers from Wikipedia...")
-    table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+    import requests
+    from io import StringIO
+    
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+    headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'}
+    
+    response = requests.get(url, headers=headers)
+    table = pd.read_html(StringIO(response.text))
     df = table[0]
     # Replace dots with dashes for Yahoo (e.g. BRK.B -> BRK-B)
     tickers = df['Symbol'].str.replace('.', '-', regex=False).tolist()

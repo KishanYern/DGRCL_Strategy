@@ -47,7 +47,7 @@ from macro_dgrcl import MacroDGRCL
 model = MacroDGRCL(
     num_stocks=50,
     num_macros=4,
-    stock_feature_dim=7,
+    stock_feature_dim=8,
     macro_feature_dim=4,
     hidden_dim=64,
     top_k=10,
@@ -66,8 +66,29 @@ mu, sigma2, embeddings = model.predict_with_uncertainty(
 ## Training
 
 ```bash
+# Train with synthetic data (quick demo)
 python train.py
+
+# Train with real market data (requires data_ingest.py first)
+python train.py --real-data
 ```
+
+### Backtesting with Walk-Forward Validation
+
+For proper backtesting on historical data:
+
+```bash
+# 1. Download and process S&P 500 + macro data
+python data_ingest.py
+
+# 2. Run walk-forward backtest
+python train.py --real-data
+```
+
+This performs walk-forward cross-validation:
+- **Train window**: 252 days (~1 year)
+- **Validation window**: 63 days (~1 quarter)
+- **Step**: Advance 63 days between folds
 
 ## Testing
 
@@ -77,13 +98,14 @@ python -m pytest test_macro_dgrcl.py -v
 
 ## Files
 
-| File                  | Description                                   |
-| --------------------- | --------------------------------------------- |
-| `macro_dgrcl.py`      | Core model architecture                       |
-| `losses.py`           | Pairwise Ranking + InfoNCE Contrastive losses |
-| `train.py`            | Training loop with AdamW optimizer            |
-| `data_ingest.py`      | S&P 500 + Macro data ingestion                |
-| `test_macro_dgrcl.py` | Pytest suite (22 tests)                       |
+| File                  | Description                                    |
+| --------------------- | ---------------------------------------------- |
+| `macro_dgrcl.py`      | Core model architecture                        |
+| `losses.py`           | Pairwise Ranking + InfoNCE Contrastive losses  |
+| `train.py`            | Training loop with walk-forward backtesting    |
+| `data_ingest.py`      | S&P 500 + Macro data ingestion                 |
+| `data_loader.py`      | CSV→Tensor loader + WalkForwardSplitter        |
+| `test_macro_dgrcl.py` | Pytest suite (22 tests)                        |
 
 ## License
 
