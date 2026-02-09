@@ -216,7 +216,7 @@ def main():
     # Hyperparameters
     NUM_STOCKS = 50
     NUM_MACROS = 4
-    STOCK_DIM = 7
+    STOCK_DIM = 8  # ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
     MACRO_DIM = 4
     HIDDEN_DIM = 64
     WINDOW_SIZE = 60

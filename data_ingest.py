@@ -122,8 +122,6 @@ def main():
         df = process_ticker_data(ticker, is_macro=True)
         if df is not None:
             macro_data[name] = df
-            # Save individual macro files
-            df.to_csv(f"{PROCESSED_DIR}/macro_{name}.csv")
     
     print(f"Successfully fetched {len(macro_data)} macro nodes.")
 
@@ -131,17 +129,53 @@ def main():
     tickers = fetch_sp500_tickers()
     print(f"Found {len(tickers)} S&P 500 tickers. Starting download (this may take time)...")
     
-    valid_stocks = []
+    stock_data = {}
     
     # For PoC, limit to first 50 to save time/bandwidth, remove slice [:] for full run
     for ticker in tickers[:50]: 
         df = process_ticker_data(ticker, is_macro=False)
-        if df is not None and len(df) > 200: # Ensure enough history
-            df.to_csv(f"{PROCESSED_DIR}/stock_{ticker}.csv")
-            valid_stocks.append(ticker)
+        if df is not None and len(df) > 200:  # Ensure enough history
+            stock_data[ticker] = df
             print(f"Processed {ticker} - {len(df)} rows")
     
-    print(f"Ingestion Complete. Processed {len(valid_stocks)} stocks and {len(macro_data)} macro nodes.")
+    # 3. CRITICAL: Align all dataframes to common date index
+    # Different tickers have different histories (VIX needs 200 days for MA_200)
+    # This prevents tensor shape mismatches during training
+    print("\nAligning all data to common date range...")
+    
+    # Find intersection of all date indices
+    all_indices = [df.index for df in macro_data.values()] + [df.index for df in stock_data.values()]
+    
+    if not all_indices:
+        print("ERROR: No valid data found!")
+        return
+    
+    common_index = all_indices[0]
+    for idx in all_indices[1:]:
+        common_index = common_index.intersection(idx)
+    
+    common_index = common_index.sort_values()
+    print(f"Common date range: {common_index[0]} to {common_index[-1]} ({len(common_index)} trading days)")
+    
+    if len(common_index) < 200:
+        print("WARNING: Common date range is very short. Consider using fewer macro indicators or longer history.")
+    
+    # 4. Align and save all data
+    for name, df in macro_data.items():
+        aligned_df = df.loc[common_index]
+        aligned_df.to_csv(f"{PROCESSED_DIR}/macro_{name}.csv")
+    
+    valid_stocks = []
+    for ticker, df in stock_data.items():
+        aligned_df = df.loc[common_index]
+        aligned_df.to_csv(f"{PROCESSED_DIR}/stock_{ticker}.csv")
+        valid_stocks.append(ticker)
+    
+    # Save common index for reference
+    pd.Series(common_index).to_csv(f"{PROCESSED_DIR}/common_index.txt", index=False, header=False)
+    
+    print(f"\nIngestion Complete. Processed {len(valid_stocks)} stocks and {len(macro_data)} macro nodes.")
+    print(f"All data aligned to {len(common_index)} common trading days.")
     print(f"Data saved to {PROCESSED_DIR}")
 
 if __name__ == "__main__":
