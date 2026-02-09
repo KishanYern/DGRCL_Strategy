@@ -38,6 +38,29 @@ def calculate_volatility(series, window=5):
     log_ret = np.log(series / series.shift(1))
     return log_ret.rolling(window=window).std()
 
+def rolling_zscore_normalize(df, window=60):
+    """
+    Apply Rolling Z-Score normalization to all columns.
+    
+    For each column: (x - rolling_mean) / rolling_std
+    This ensures all features are scaled to ~N(0,1).
+    
+    Args:
+        df: DataFrame with feature columns
+        window: Rolling window size (default 60 days)
+    
+    Returns:
+        Normalized DataFrame with same columns
+    """
+    normalized = pd.DataFrame(index=df.index)
+    for col in df.columns:
+        rolling_mean = df[col].rolling(window=window, min_periods=1).mean()
+        rolling_std = df[col].rolling(window=window, min_periods=1).std()
+        # Avoid division by zero
+        rolling_std = rolling_std.replace(0, 1e-8)
+        normalized[col] = (df[col] - rolling_mean) / rolling_std
+    return normalized
+
 # --- Main Execution ---
 def fetch_sp500_tickers():
     print("Scraping S&P 500 tickers from Wikipedia...")
@@ -79,6 +102,10 @@ def process_ticker_data(ticker, is_macro=False):
             cols = ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
             df = df[cols]
 
+        # Apply Rolling Z-Score Normalization
+        # Critical: Neural networks require inputs scaled to ~N(0,1)
+        df = rolling_zscore_normalize(df, window=60)
+        
         df = df.dropna()
         return df
     except Exception as e:

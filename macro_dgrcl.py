@@ -227,10 +227,17 @@ class DynamicGraphLearner(nn.Module):
         topk_values, topk_indices = torch.topk(attention, k=k, dim=1)  # [N, k]
         
         # Build sparse edge_index
-        src = torch.arange(N, device=embeddings.device).unsqueeze(1).repeat(1, k)  # [N, k]
-        dst = topk_indices  # [N, k]
+        # CRITICAL: In PyG MessagePassing, info flows src → dst
+        # Node i computed which neighbors j are relevant, so i should RECEIVE from j
+        # Therefore edges are: src=j (neighbors), dst=i (computing node)
+        row_indices = torch.arange(N, device=embeddings.device).unsqueeze(1).repeat(1, k)  # [N, k]  (node i)
+        col_indices = topk_indices  # [N, k]  (neighbors j that node i selected)
         
-        edge_index = torch.stack([src.flatten(), dst.flatten()], dim=0)  # [2, N*k]
+        # Edges: j → i (so node i receives messages from its selected neighbors j)
+        src = col_indices.flatten()  # neighbors j
+        dst = row_indices.flatten()  # node i that selected them
+        
+        edge_index = torch.stack([src, dst], dim=0)  # [2, N*k]
         
         if return_weights:
             # Normalize weights via softmax over selected neighbors
@@ -514,7 +521,7 @@ class MacroDGRCL(nn.Module):
         self,
         num_stocks: int,
         num_macros: int,
-        stock_feature_dim: int = 7,
+        stock_feature_dim: int = 8,  # ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
         macro_feature_dim: int = 4,
         hidden_dim: int = 64,
         temporal_layers: int = 2,
