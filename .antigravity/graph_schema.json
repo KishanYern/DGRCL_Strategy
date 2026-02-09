@@ -1,0 +1,60 @@
+{
+  "graph_type": "Heterogeneous",
+  "nodes": {
+    "stock": {
+      "count_approx": 500,
+      "entities": "S&P 500 Constituents",
+      "features": [
+        "Close",
+        "High",
+        "Low",
+        "Volume",
+        "RSI_14",
+        "MACD",
+        "Volatility_5"
+      ],
+      "feature_dim": 7,
+      "normalization": "Rolling Z-Score (60d)"
+    },
+    "macro": {
+      "count_fixed": 4,
+      "entities": [
+        { "name": "Energy", "ticker": "CL=F" },
+        { "name": "Rates", "ticker": "^TNX" },
+        { "name": "Currency", "ticker": "DX-Y.NYB" },
+        { "name": "Fear", "ticker": "^VIX" }
+      ],
+      "features": [
+        "Close",
+        "Percent_Change",
+        "MA_50",
+        "MA_200"
+      ],
+      "feature_dim": 4,
+      "normalization": "Rolling Z-Score (60d)"
+    }
+  },
+  "edges": {
+    "macro_to_stock": {
+      "source": "macro",
+      "target": "stock",
+      "type": "directed",
+      "mechanism": "hybrid",
+      "description": "Hardcoded sector connections + Learned dynamic attention"
+    },
+    "stock_to_stock": {
+      "source": "stock",
+      "target": "stock",
+      "type": "directed",
+      "mechanism": "dynamic_learner",
+      "description": "Latent similarity based on node embeddings"
+    },
+    "stock_to_macro": {
+      "source": "stock",
+      "target": "macro",
+      "type": "directed",
+      "mechanism": "aggregation",
+      "description": "Feedback loop from sector performance to macro state"
+    }
+  }
+}

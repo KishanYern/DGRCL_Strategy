@@ -1,0 +1,49 @@
+model:
+    name: "DGRCL_Confidence_Aware"
+    temporal_encoder:
+        type: "LSTM"
+        hidden_dim: 64
+        layers: 2
+    graph_learner:
+        activation: "LeakyReLU"
+        heads: 4
+        dropout: 0.3 # Critical for MC Dropout
+    training:
+        lookback_window: 30 # Days
+        prediction_horizon: 1 # Day
+        batch_size: 32
+        learning_rate: 0.001
+        loss_function: "PairwiseRankingLoss"
+        contrastive_weight: 0.1
+        epochs: 100
+
+backtest:
+    window_type: "rolling"
+    train_period_years: 3
+    test_period_months: 3
+    target_metric: "Information Coefficient (IC)"
+
+execution:
+    logic: "Sniper Selection"
+    confidence_metric: "Sharpe-like Ratio (Mean / Variance)"
+    filters:
+        min_confidence_ratio: 2.0
+        max_variance_percentile: 0.80 # Reject top 20% most uncertain predictions
+
+    allocation_gating:
+        metric: "Global Confidence Index (GCI)"
+        rules:
+            - condition: "GCI < 0.5"
+              action: "cash"
+              size: 0.0
+            - condition: "0.5 <= GCI < 0.8"
+              action: "half_size"
+              size: 0.5
+            - condition: "GCI >= 0.8"
+              action: "full_size"
+              size: 1.0
+
+    risk_management:
+        holding_period: 1 # Day
+        net_exposure: "Dollar Neutral"
+        order_type: "MOC" # Market On Close

@@ -1,0 +1,35 @@
+{
+  "project_name": "The Hydra",
+  "version": "1.1",
+  "architecture_type": "Macro-Aware DGRCL",
+  "objective": "Market-neutral, ranking-based systematic trading with uncertainty estimation.",
+  "environment": {
+    "platform": "Antigravity",
+    "python_version": "3.10+",
+    "frameworks": [
+      "pytorch>=2.0",
+      "pytorch_geometric",
+      "yfinance",
+      "pandas",
+      "numpy"
+    ],
+    "hardware_acceleration": {
+      "provider": "AMD",
+      "device_type": "GPU",
+      "min_vram_gb": 8
+    }
+  },
+  "directory_structure": {
+    "data_root": "./data",
+    "raw_data": "./data/raw",
+    "processed_tensors": "./data/processed",
+    "checkpoints": "./checkpoints",
+    "logs": "./logs",
+    "results": "./results"
+  },
+  "execution_mode": {
+    "inference_type": "monte_carlo_dropout",
+    "mc_samples": 10,
+    "precision": "float32"
+  }
+}
