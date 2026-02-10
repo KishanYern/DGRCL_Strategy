@@ -22,7 +22,8 @@ from dataclasses import dataclass
 
 def load_processed_data(
     data_dir: str = "./data/processed",
-    device: torch.device = None
+    device: torch.device = None,
+    max_stocks: Optional[int] = 150
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, pd.DatetimeIndex, List[str]]:
     """
     Load processed CSV files from data_ingest.py and convert to tensors.
@@ -32,7 +33,7 @@ def load_processed_data(
         device: Torch device (default: CPU)
         
     Returns:
-        stock_tensor: [N_stocks, T, 8] stock features
+        stock_tensor: [N_stocks, T, 8] stock features (N_stocks ≤ max_stocks)
         macro_tensor: [N_macros, T, 4] macro features  
         returns_tensor: [N_stocks, T] stock returns (for labels)
         dates: DatetimeIndex of time dimension
@@ -64,6 +65,18 @@ def load_processed_data(
         df = pd.read_csv(f, index_col=0, parse_dates=True)
         stock_dfs.append(df)
         stock_tickers.append(ticker)
+    
+    # Limit stock universe for VRAM management
+    if max_stocks is not None and len(stock_dfs) > max_stocks:
+        print(f"  Selecting top {max_stocks} stocks from {len(stock_dfs)} by avg absolute returns (liquidity proxy)...")
+        avg_abs_returns = [
+            df['Returns'].abs().mean() if 'Returns' in df.columns else df.iloc[:, -1].abs().mean()
+            for df in stock_dfs
+        ]
+        top_indices = np.argsort(avg_abs_returns)[::-1][:max_stocks]
+        top_indices = sorted(top_indices)  # Preserve alphabetical order
+        stock_dfs = [stock_dfs[i] for i in top_indices]
+        stock_tickers = [stock_tickers[i] for i in top_indices]
     
     # Load macro data
     macro_files = sorted(glob.glob(os.path.join(data_dir, "macro_*.csv")))
@@ -336,7 +349,8 @@ def load_and_prepare_backtest(
     window_size: int = 60,
     forecast_horizon: int = 5,
     snapshot_step: int = 1,
-    device: torch.device = None
+    device: torch.device = None,
+    max_stocks: Optional[int] = 150
 ) -> Tuple[List, pd.DatetimeIndex, List[str], int, int]:
     """
     Convenience function to load data and create backtest folds in one call.
@@ -351,7 +365,8 @@ def load_and_prepare_backtest(
     # Load data
     stock_data, macro_data, returns_data, dates, tickers = load_processed_data(
         data_dir=data_dir,
-        device=device
+        device=device,
+        max_stocks=max_stocks
     )
     
     # Create splitter

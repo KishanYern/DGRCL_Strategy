@@ -1,18 +1,19 @@
 """
-Unit Tests for Macro-Aware DGRCL v1.1
+Unit Tests for Macro-Aware DGRCL v1.3 (Multi-Task Learning)
 
 Tests:
 1. HeteroData graph construction
 2. Temporal encoder output shapes
 3. Dynamic graph learner sparsity
 4. MacroPropagation aggregation
-5. MC Dropout variance
-6. Full forward pass
-7. Loss computation
+5. MultiTaskHead outputs and constraints
+6. Full forward pass (MTL)
+7. End-to-end training step
 """
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from macro_dgrcl import (
@@ -20,10 +21,9 @@ from macro_dgrcl import (
     TemporalEncoder,
     DynamicGraphLearner,
     MacroPropagation,
-    MCDropoutHead,
+    MultiTaskHead,
     MacroDGRCL
 )
-from losses import pairwise_ranking_loss, info_nce_loss, dgrcl_loss, DGRCLLoss
 
 
 # =============================================================================
@@ -41,7 +41,7 @@ def sample_data():
     N_s = 50  # Number of stocks
     N_m = 4   # Number of macro factors
     T = 60    # Sequence length
-    d_s = 7   # Stock feature dim
+    d_s = 8   # Stock feature dim (v1.3: 8 features)
     d_m = 4   # Macro feature dim
     H = 64    # Hidden dim
     
@@ -75,22 +75,16 @@ class TestHeteroGraphBuilder:
             macro_features=sample_data['macro_features']
         )
         
-        # Check node types exist
         assert 'stock' in data.node_types
         assert 'macro' in data.node_types
-        
-        # Check node counts
         assert data['stock'].num_nodes == sample_data['N_s']
         assert data['macro'].num_nodes == sample_data['N_m']
-        
-        # Check feature shapes
         assert data['stock'].x.shape == sample_data['stock_features'].shape
         assert data['macro'].x.shape == sample_data['macro_features'].shape
     
     def test_edge_types_present(self, sample_data):
         """Test that default edges are created."""
         builder = HeteroGraphBuilder()
-        
         stock_stock_edges = torch.randint(0, sample_data['N_s'], (2, 100))
         
         data = builder.build(
@@ -99,7 +93,6 @@ class TestHeteroGraphBuilder:
             stock_stock_edges=stock_stock_edges
         )
         
-        # Check edge types
         assert ('stock', 'relates', 'stock') in data.edge_types
         assert ('macro', 'influences', 'stock') in data.edge_types
 
@@ -119,7 +112,6 @@ class TestTemporalEncoder:
         )
         
         output = encoder(sample_data['stock_features'])
-        
         assert output.shape == (sample_data['N_s'], sample_data['H'])
     
     def test_bidirectional_doubles_dim(self, sample_data):
@@ -132,7 +124,6 @@ class TestTemporalEncoder:
         )
         
         output = encoder(sample_data['stock_features'])
-        
         assert output.shape == (sample_data['N_s'], 2 * sample_data['H'])
     
     def test_gradient_flow(self, sample_data):
@@ -169,7 +160,6 @@ class TestDynamicGraphLearner:
             return_weights=True
         )
         
-        # edge_index should be [2, N * top_k]
         expected_edges = sample_data['N_s'] * 10
         assert edge_index.shape == (2, expected_edges)
         assert edge_weight.shape == (expected_edges,)
@@ -184,10 +174,8 @@ class TestDynamicGraphLearner:
         
         edge_index, _ = learner(sample_data['stock_embeddings'])
         
-        # Count edges per source node
         src = edge_index[0]
         unique, counts = torch.unique(src, return_counts=True)
-        
         assert (counts == top_k).all()
     
     def test_dynamic_changes_with_embeddings(self, sample_data):
@@ -200,7 +188,6 @@ class TestDynamicGraphLearner:
         edge_index1, _ = learner(sample_data['stock_embeddings'])
         edge_index2, _ = learner(torch.randn_like(sample_data['stock_embeddings']))
         
-        # Edges should differ
         assert not torch.equal(edge_index1, edge_index2)
 
 
@@ -219,7 +206,6 @@ class TestMacroPropagation:
             heads=4
         )
         
-        # Create edges
         stock_stock_edges = torch.randint(0, sample_data['N_s'], (2, 200))
         macro_stock_edges = torch.stack([
             torch.arange(sample_data['N_m']).repeat_interleave(sample_data['N_s']),
@@ -250,7 +236,6 @@ class TestMacroPropagation:
             torch.arange(sample_data['N_s']).repeat(sample_data['N_m'])
         ])
         
-        # Run with different macro embeddings
         out1 = mp(
             stock_h=sample_data['stock_embeddings'],
             macro_h=sample_data['macro_embeddings'],
@@ -265,67 +250,103 @@ class TestMacroPropagation:
             macro_stock_edge_index=macro_stock_edges
         )
         
-        # Outputs should differ
         assert not torch.allclose(out1, out2)
 
 
 # =============================================================================
-# TEST: MC DROPOUT HEAD
+# TEST: MULTI-TASK HEAD
 # =============================================================================
 
-class TestMCDropoutHead:
+class TestMultiTaskHead:
     
-    def test_basic_output_shape(self, sample_data):
-        """Test output shape."""
-        head = MCDropoutHead(
-            input_dim=sample_data['H'],
-            hidden_dim=64,
-            output_dim=1
-        )
-        
-        output = head(sample_data['stock_embeddings'])
-        
-        assert output.shape == (sample_data['N_s'], 1)
-    
-    def test_force_dropout_produces_variance(self, sample_data):
-        """Test that force_dropout=True produces different outputs."""
-        head = MCDropoutHead(
-            input_dim=sample_data['H'],
-            hidden_dim=64,
-            output_dim=1,
-            dropout=0.5  # High dropout for visible variance
-        )
-        head.eval()  # Switch to eval mode
-        
-        # Multiple forward passes with force_dropout
-        outputs = [
-            head(sample_data['stock_embeddings'], force_dropout=True)
-            for _ in range(10)
-        ]
-        
-        # Check outputs differ
-        all_same = all(torch.allclose(outputs[0], o) for o in outputs[1:])
-        assert not all_same, "MC Dropout should produce different outputs"
-    
-    def test_mc_forward_returns_mu_sigma(self, sample_data):
-        """Test mc_forward returns mean and variance."""
-        head = MCDropoutHead(
-            input_dim=sample_data['H'],
-            hidden_dim=64,
-            output_dim=1,
+    def test_output_shapes(self, sample_data):
+        """Test both heads return [N, 1] tensors."""
+        head = MultiTaskHead(
+            hidden_dim=sample_data['H'],
             dropout=0.3
         )
         
-        mu, sigma2 = head.mc_forward(sample_data['stock_embeddings'], n_samples=50)
+        dir_logits, mag_preds = head(sample_data['stock_embeddings'])
         
-        assert mu.shape == (sample_data['N_s'], 1)
-        assert sigma2.shape == (sample_data['N_s'], 1)
+        assert dir_logits.shape == (sample_data['N_s'], 1)
+        assert mag_preds.shape == (sample_data['N_s'], 1)
+    
+    def test_magnitude_non_negative(self, sample_data):
+        """Test that mag_head output is always non-negative (Softplus guarantee)."""
+        head = MultiTaskHead(
+            hidden_dim=sample_data['H'],
+            dropout=0.0  # No dropout for deterministic test
+        )
         
-        # Variance should be positive
-        assert (sigma2 >= 0).all()
+        # Test with various inputs including extreme values
+        for _ in range(10):
+            x = torch.randn(sample_data['N_s'], sample_data['H']) * 5  # Large magnitude inputs
+            _, mag_preds = head(x)
+            assert (mag_preds >= 0).all(), \
+                f"Magnitude predictions should be non-negative, got min={mag_preds.min().item()}"
+    
+    def test_direction_logits_unbounded(self, sample_data):
+        """Test that dir_head logits can take any real value."""
+        head = MultiTaskHead(
+            hidden_dim=sample_data['H'],
+            dropout=0.0
+        )
         
-        # With dropout, variance should be non-zero
-        assert sigma2.sum() > 0
+        # Collect logits from multiple random inputs
+        all_logits = []
+        for _ in range(20):
+            x = torch.randn(sample_data['N_s'], sample_data['H']) * 3
+            dir_logits, _ = head(x)
+            all_logits.append(dir_logits)
+        
+        all_logits = torch.cat(all_logits)
+        # Should have both positive and negative values
+        assert all_logits.min() < 0, "Direction logits should include negative values"
+        assert all_logits.max() > 0, "Direction logits should include positive values"
+    
+    def test_gradient_flow(self, sample_data):
+        """Test gradients flow through both heads."""
+        head = MultiTaskHead(
+            hidden_dim=sample_data['H'],
+            dropout=0.0
+        )
+        
+        x = sample_data['stock_embeddings'].clone().requires_grad_(True)
+        dir_logits, mag_preds = head(x)
+        
+        # Backprop through direction head
+        loss_dir = dir_logits.sum()
+        loss_dir.backward(retain_graph=True)
+        assert x.grad is not None
+        assert not torch.isnan(x.grad).any()
+        
+        x.grad.zero_()
+        
+        # Backprop through magnitude head
+        loss_mag = mag_preds.sum()
+        loss_mag.backward()
+        assert not torch.isnan(x.grad).any()
+    
+    def test_shared_block_connects_heads(self, sample_data):
+        """Test that both heads share the initial linear block."""
+        head = MultiTaskHead(
+            hidden_dim=sample_data['H'],
+            dropout=0.0
+        )
+        
+        # Check that shared block parameters affect both outputs
+        x = sample_data['stock_embeddings']
+        dir_logits_1, mag_preds_1 = head(x)
+        
+        # Perturb shared block weights
+        with torch.no_grad():
+            head.shared[0].weight.add_(torch.randn_like(head.shared[0].weight) * 0.5)
+        
+        dir_logits_2, mag_preds_2 = head(x)
+        
+        # Both outputs should change
+        assert not torch.allclose(dir_logits_1, dir_logits_2)
+        assert not torch.allclose(mag_preds_1, mag_preds_2)
 
 
 # =============================================================================
@@ -335,7 +356,7 @@ class TestMCDropoutHead:
 class TestMacroDGRCL:
     
     def test_forward_pass(self, sample_data, device):
-        """Test full forward pass."""
+        """Test full forward pass returns (dir_logits, mag_preds)."""
         model = MacroDGRCL(
             num_stocks=sample_data['N_s'],
             num_macros=sample_data['N_m'],
@@ -347,38 +368,13 @@ class TestMacroDGRCL:
         stock_feat = sample_data['stock_features'].to(device)
         macro_feat = sample_data['macro_features'].to(device)
         
-        scores, embeddings = model(stock_feat, macro_feat)
+        dir_logits, mag_preds = model(stock_feat, macro_feat)
         
-        assert scores.shape == (sample_data['N_s'], 1)
-        assert embeddings.shape == (sample_data['N_s'], sample_data['H'])
+        assert dir_logits.shape == (sample_data['N_s'], 1)
+        assert mag_preds.shape == (sample_data['N_s'], 1)
     
-    def test_forward_with_force_dropout(self, sample_data, device):
-        """Test forward with MC Dropout enabled."""
-        model = MacroDGRCL(
-            num_stocks=sample_data['N_s'],
-            num_macros=sample_data['N_m'],
-            stock_feature_dim=sample_data['d_s'],
-            macro_feature_dim=sample_data['d_m'],
-            hidden_dim=sample_data['H'],
-            mc_dropout=0.5
-        ).to(device)
-        model.eval()
-        
-        stock_feat = sample_data['stock_features'].to(device)
-        macro_feat = sample_data['macro_features'].to(device)
-        
-        # Multiple passes with force_dropout
-        outputs = [
-            model(stock_feat, macro_feat, force_dropout=True)[0]
-            for _ in range(5)
-        ]
-        
-        # Outputs should differ
-        all_same = all(torch.allclose(outputs[0], o) for o in outputs[1:])
-        assert not all_same
-    
-    def test_predict_with_uncertainty(self, sample_data, device):
-        """Test uncertainty estimation."""
+    def test_magnitude_always_positive(self, sample_data, device):
+        """Test model magnitude output is always non-negative."""
         model = MacroDGRCL(
             num_stocks=sample_data['N_s'],
             num_macros=sample_data['N_m'],
@@ -390,80 +386,60 @@ class TestMacroDGRCL:
         stock_feat = sample_data['stock_features'].to(device)
         macro_feat = sample_data['macro_features'].to(device)
         
-        mu, sigma2, embeddings = model.predict_with_uncertainty(
-            stock_feat, macro_feat, n_samples=30
-        )
+        _, mag_preds = model(stock_feat, macro_feat)
         
-        assert mu.shape == (sample_data['N_s'], 1)
-        assert sigma2.shape == (sample_data['N_s'], 1)
-        assert (sigma2 >= 0).all()
-
-
-# =============================================================================
-# TEST: LOSS FUNCTIONS
-# =============================================================================
-
-class TestLossFunctions:
+        assert (mag_preds >= 0).all(), "Magnitude predictions must be non-negative"
     
-    def test_pairwise_ranking_loss_positive(self, sample_data):
-        """Test ranking loss is positive."""
-        scores = torch.randn(sample_data['N_s'], 1)
-        returns = sample_data['returns']
+    def test_no_nan_in_outputs(self, sample_data, device):
+        """Test no NaN values in model outputs."""
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
         
-        loss = pairwise_ranking_loss(scores, returns)
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
         
-        assert loss >= 0
-        assert not torch.isnan(loss)
+        dir_logits, mag_preds = model(stock_feat, macro_feat)
+        
+        assert not torch.isnan(dir_logits).any(), "NaN in direction logits"
+        assert not torch.isnan(mag_preds).any(), "NaN in magnitude predictions"
     
-    def test_ranking_loss_zero_for_perfect_ranking(self, sample_data):
-        """Test loss approaches zero for perfect predictions."""
-        # Create scores that perfectly match ranking
-        returns = sample_data['returns']
-        scores = returns.clone().unsqueeze(-1) * 100  # Large margin
+    def test_gradient_flow_full_model(self, sample_data, device):
+        """Test gradients flow through the full model for both tasks."""
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
         
-        loss = pairwise_ranking_loss(scores, returns, margin=1.0)
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        returns = sample_data['returns'].to(device)
         
-        assert loss < 0.5  # Should be relatively small with perfect ranking
-    
-    def test_info_nce_loss_positive(self, sample_data):
-        """Test InfoNCE loss is positive."""
-        embeddings = sample_data['stock_embeddings']
+        dir_logits, mag_preds = model(stock_feat, macro_feat)
         
-        loss = info_nce_loss(embeddings)
+        # Compute MTL loss
+        median_return = returns.median()
+        dir_target = (returns > median_return).float()
+        mag_target = torch.abs(returns)
         
-        assert loss >= 0
-        assert not torch.isnan(loss)
-    
-    def test_dgrcl_loss_gradient_flow(self, sample_data):
-        """Test gradients flow through combined loss."""
-        scores = torch.randn(sample_data['N_s'], 1, requires_grad=True)
-        embeddings = torch.randn(sample_data['N_s'], sample_data['H'], requires_grad=True)
-        returns = sample_data['returns']
+        bce_loss = nn.BCEWithLogitsLoss()(dir_logits.squeeze(-1), dir_target)
+        mse_loss = nn.MSELoss()(mag_preds.squeeze(-1), mag_target)
+        total_loss = bce_loss + mse_loss
         
-        loss = dgrcl_loss(scores, embeddings, returns)
-        loss.backward()
+        total_loss.backward()
         
-        assert scores.grad is not None
-        assert embeddings.grad is not None
-        assert not torch.isnan(scores.grad).any()
-        assert not torch.isnan(embeddings.grad).any()
-    
-    def test_dgrcl_loss_module(self, sample_data):
-        """Test DGRCLLoss module."""
-        criterion = DGRCLLoss(
-            ranking_margin=1.0,
-            nce_temperature=0.07,
-            nce_weight=0.1
-        )
-        
-        scores = torch.randn(sample_data['N_s'], 1)
-        embeddings = sample_data['stock_embeddings']
-        returns = sample_data['returns']
-        
-        loss = criterion(scores, embeddings, returns)
-        
-        assert loss >= 0
-        assert not torch.isnan(loss)
+        # Check gradients exist for key parameters
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"No gradient for {name}"
+                assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
 
 
 # =============================================================================
@@ -484,7 +460,8 @@ class TestEndToEnd:
             hidden_dim=sample_data['H']
         ).to(device)
         
-        criterion = DGRCLLoss()
+        bce_loss_fn = nn.BCEWithLogitsLoss()
+        mse_loss_fn = nn.MSELoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         
         stock_feat = sample_data['stock_features'].to(device)
@@ -496,12 +473,143 @@ class TestEndToEnd:
             stock_features=stock_feat,
             macro_features=macro_feat,
             returns=returns,
-            criterion=criterion,
-            optimizer=optimizer
+            optimizer=optimizer,
+            bce_loss_fn=bce_loss_fn,
+            mse_loss_fn=mse_loss_fn,
+            mag_weight=1.0
         )
         
         assert not torch.isnan(torch.tensor(metrics['loss']))
         assert metrics['loss'] >= 0
+        assert 0 <= metrics['dir_accuracy'] <= 1
+        assert metrics['mag_mae'] >= 0
+    
+    def test_training_step_returns_all_metrics(self, sample_data, device):
+        """Test that train_step returns all expected metric keys."""
+        from train import train_step
+        
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        bce_loss_fn = nn.BCEWithLogitsLoss()
+        mse_loss_fn = nn.MSELoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        returns = sample_data['returns'].to(device)
+        
+        metrics = train_step(
+            model=model,
+            stock_features=stock_feat,
+            macro_features=macro_feat,
+            returns=returns,
+            optimizer=optimizer,
+            bce_loss_fn=bce_loss_fn,
+            mse_loss_fn=mse_loss_fn,
+        )
+        
+        expected_keys = {'loss', 'loss_dir', 'loss_mag', 'dir_accuracy', 'mag_mae', 'grad_norm'}
+        assert set(metrics.keys()) == expected_keys
+    
+    def test_evaluate_returns_metrics(self, sample_data, device):
+        """Test that evaluate returns multi-task metrics."""
+        from train import evaluate
+        
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        bce_loss_fn = nn.BCEWithLogitsLoss()
+        mse_loss_fn = nn.MSELoss()
+        
+        # Create a small validation set
+        val_data = [
+            (sample_data['stock_features'], sample_data['macro_features'], sample_data['returns'])
+        ]
+        
+        val_metrics = evaluate(
+            model=model,
+            data_loader=val_data,
+            bce_loss_fn=bce_loss_fn,
+            mse_loss_fn=mse_loss_fn,
+            device=device,
+            mag_weight=1.0
+        )
+        
+        expected_keys = {'loss', 'loss_dir', 'loss_mag', 'dir_accuracy', 'mag_mae'}
+        assert set(val_metrics.keys()) == expected_keys
+        assert val_metrics['loss'] >= 0
+    
+    def test_early_stopping(self):
+        """Test EarlyStopping behavior."""
+        from train import EarlyStopping
+        
+        model = nn.Linear(10, 1)
+        es = EarlyStopping(patience=3, min_delta=0.01)
+        
+        # Simulate improving losses
+        assert not es(1.0, model)
+        assert not es(0.9, model)
+        assert not es(0.8, model)
+        
+        # Simulate stagnation
+        assert not es(0.8, model)  # counter=1
+        assert not es(0.8, model)  # counter=2
+        assert es(0.8, model)       # counter=3 >= patience
+        
+        assert es.early_stop
+    
+    def test_mag_weight_affects_loss(self, sample_data, device):
+        """Test that changing mag_weight changes the total loss."""
+        from train import train_step
+        
+        # Create two identical models
+        torch.manual_seed(42)
+        model1 = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        torch.manual_seed(42)
+        model2 = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        bce_loss_fn = nn.BCEWithLogitsLoss()
+        mse_loss_fn = nn.MSELoss()
+        opt1 = torch.optim.AdamW(model1.parameters(), lr=1e-3)
+        opt2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+        
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        returns = sample_data['returns'].to(device)
+        
+        m1 = train_step(model1, stock_feat, macro_feat, returns, opt1,
+                        bce_loss_fn, mse_loss_fn, mag_weight=0.1)
+        m2 = train_step(model2, stock_feat, macro_feat, returns, opt2,
+                        bce_loss_fn, mse_loss_fn, mag_weight=10.0)
+        
+        # Direction loss should be very similar (not identical due to GPU non-determinism),
+        # but total loss should clearly differ due to mag_weight
+        assert abs(m1['loss_dir'] - m2['loss_dir']) < 0.05
+        assert m1['loss'] != m2['loss']
 
 
 if __name__ == "__main__":

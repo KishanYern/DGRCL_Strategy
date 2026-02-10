@@ -182,7 +182,7 @@ def main():
     # Create temporary DataFrame of just returns aligned to common index
     clean_stock_data = {}
     for ticker, df in stock_data.items():
-        clean_stock_data[ticker] = df.loc[common_index]
+        clean_stock_data[ticker] = df.loc[common_index].copy()
     
     # Extract returns matrix [Time, Stocks]
     returns_matrix = pd.DataFrame({

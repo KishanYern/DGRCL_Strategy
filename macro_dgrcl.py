@@ -1,11 +1,11 @@
 """
-Macro-Aware DGRCL v1.1 - Dynamic Graph Relation Contrastive Learning
+Macro-Aware DGRCL v1.3 - Multi-Task Learning Architecture
 
 A Heterogeneous Graph Neural Network for market-neutral trading with:
 - Explicit Macro factor nodes (not feature vectors)
 - Dynamic Stock→Stock edge learning via attention
 - Hybrid Macro→Stock edges (fixed + learned)
-- Monte Carlo Dropout for epistemic uncertainty
+- Multi-Task Head: Direction (binary) + Magnitude (regression)
 """
 
 import torch
@@ -26,7 +26,7 @@ class HeteroGraphBuilder:
     Constructs PyG HeteroData from raw stock/macro tensors.
     
     Node Types:
-        - 'stock': N_s nodes with d_s=7 features
+        - 'stock': N_s nodes with d_s=8 features
         - 'macro': N_m nodes with d_m=4 features
     
     Edge Types:
@@ -413,91 +413,68 @@ class MacroPropagation(MessagePassing):
 
 
 # =============================================================================
-# MC DROPOUT HEAD
+# MULTI-TASK HEAD
 # =============================================================================
 
-class MCDropoutHead(nn.Module):
+class MultiTaskHead(nn.Module):
     """
-    Output head with Monte Carlo Dropout for epistemic uncertainty estimation.
+    Multi-Task output head for decoupled direction and magnitude prediction.
     
-    At inference, use force_dropout=True to enable stochastic passes.
-    Multiple forward passes yield μ (mean prediction) and σ² (variance).
+    Architecture:
+        Shared:  Linear(H, H) -> ReLU -> Dropout
+        dir_head: Linear(H, H//2) -> ReLU -> Dropout -> Linear(1)  [logits]
+        mag_head: Linear(H, H//2) -> ReLU -> Dropout -> Linear(1) -> Softplus  [positive]
+    
+    Direction predicts P(return > cross-sectional median) via BCEWithLogitsLoss.
+    Magnitude predicts |R_t| via MSELoss, guaranteed non-negative by Softplus.
     """
     
     def __init__(
         self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        output_dim: int = 1,
+        hidden_dim: int,
         dropout: float = 0.3
     ):
         super().__init__()
-        self.dropout = dropout
         
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        # Shared feature extraction block
+        self.shared = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout)
+        )
+        
+        # Direction head: outputs unbounded logits for BCEWithLogitsLoss
+        self.dir_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, output_dim)
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # Magnitude head: outputs positive scalar via Softplus
+        self.mag_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()
         )
     
-    def forward(
-        self,
-        x: torch.Tensor,
-        force_dropout: bool = False
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass with optional forced dropout.
+        Forward pass through shared block then both task heads.
         
         Args:
-            x: [N, input_dim] embeddings
-            force_dropout: If True, apply dropout even in eval mode
+            x: [N, hidden_dim] GNN embeddings
             
         Returns:
-            scores: [N, output_dim] ranking scores
+            dir_logits: [N, 1] unbounded logits for direction classification
+            mag_preds:  [N, 1] positive magnitude predictions
         """
-        if force_dropout:
-            # Force dropout on regardless of training mode
-            return self._forward_with_dropout(x)
-        return self.layers(x)
-    
-    def _forward_with_dropout(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply dropout layers manually."""
-        h = x
-        for layer in self.layers:
-            if isinstance(layer, nn.Dropout):
-                h = F.dropout(h, p=self.dropout, training=True)
-            else:
-                h = layer(h)
-        return h
-    
-    def mc_forward(
-        self,
-        x: torch.Tensor,
-        n_samples: int = 30
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Monte Carlo forward passes for uncertainty estimation.
-        
-        Args:
-            x: [N, input_dim] embeddings
-            n_samples: Number of stochastic forward passes
-            
-        Returns:
-            mu: [N, output_dim] mean predictions
-            sigma2: [N, output_dim] variance (epistemic uncertainty)
-        """
-        outputs = torch.stack([
-            self.forward(x, force_dropout=True) for _ in range(n_samples)
-        ], dim=0)  # [K, N, output_dim]
-        
-        mu = outputs.mean(dim=0)
-        sigma2 = outputs.var(dim=0)
-        
-        return mu, sigma2
+        shared_features = self.shared(x)  # [N, H]
+        dir_logits = self.dir_head(shared_features)  # [N, 1]
+        mag_preds = self.mag_head(shared_features)   # [N, 1]
+        return dir_logits, mag_preds
 
 
 # =============================================================================
@@ -506,15 +483,15 @@ class MCDropoutHead(nn.Module):
 
 class MacroDGRCL(nn.Module):
     """
-    Macro-Aware Dynamic Graph Relation Contrastive Learning Model.
+    Macro-Aware Dynamic Graph Relation Contrastive Learning Model v1.3.
     
-    Architecture:
+    Multi-Task Learning Architecture:
         1. TemporalEncoder: LSTM projects time-series → embeddings
         2. DynamicGraphLearner: Computes dynamic Stock→Stock adjacency
         3. MacroPropagation: Custom message passing with dual aggregation
-        4. MCDropoutHead: Ranking scores with uncertainty estimation
+        4. MultiTaskHead: Direction (binary) + Magnitude (regression)
     
-    Forward returns both ranking scores and embeddings for contrastive loss.
+    Forward returns (direction_logits, magnitude_preds) for MTL training.
     """
     
     def __init__(
@@ -529,7 +506,7 @@ class MacroDGRCL(nn.Module):
         heads: int = 4,
         top_k: int = 10,
         dropout: float = 0.1,
-        mc_dropout: float = 0.3
+        head_dropout: float = 0.3
     ):
         super().__init__()
         
@@ -574,12 +551,10 @@ class MacroDGRCL(nn.Module):
             nn.LayerNorm(hidden_dim) for _ in range(mp_layers)
         ])
         
-        # MC Dropout Head
-        self.output_head = MCDropoutHead(
-            input_dim=hidden_dim,
+        # Multi-Task Head (Direction + Magnitude)
+        self.output_head = MultiTaskHead(
             hidden_dim=hidden_dim,
-            output_dim=1,
-            dropout=mc_dropout
+            dropout=head_dropout
         )
         
         # Graph builder
@@ -590,20 +565,18 @@ class MacroDGRCL(nn.Module):
         stock_features: torch.Tensor,  # [N_s, T, d_s]
         macro_features: torch.Tensor,  # [N_m, T, d_m]
         macro_stock_edges: Optional[torch.Tensor] = None,  # [2, E_ms]
-        force_dropout: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass.
+        Forward pass through GNN backbone and Multi-Task head.
         
         Args:
             stock_features: [N_s, T, d_s] stock time-series
             macro_features: [N_m, T, d_m] macro time-series
             macro_stock_edges: [2, E_ms] macro→stock edge index
-            force_dropout: Enable MC Dropout for uncertainty
             
         Returns:
-            scores: [N_s, 1] ranking scores
-            embeddings: [N_s, H] final embeddings for contrastive loss
+            direction_logits: [N_s, 1] unbounded logits for P(return > median)
+            magnitude_preds:  [N_s, 1] predicted |R_t| (non-negative)
         """
         # 1. Temporal Encoding
         stock_h = self.stock_encoder(stock_features)  # [N_s, H]
@@ -635,53 +608,7 @@ class MacroDGRCL(nn.Module):
             # Residual connection + LayerNorm
             h = ln(h + h_new)
         
-        # 5. Output head with optional MC Dropout
-        scores = self.output_head(h, force_dropout=force_dropout)
+        # 5. Multi-Task Head
+        direction_logits, magnitude_preds = self.output_head(h)
         
-        return scores, h
-    
-    def predict_with_uncertainty(
-        self,
-        stock_features: torch.Tensor,
-        macro_features: torch.Tensor,
-        macro_stock_edges: Optional[torch.Tensor] = None,
-        n_samples: int = 30
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Inference with epistemic uncertainty via MC Dropout.
-        
-        Returns:
-            mu: [N_s, 1] mean predictions
-            sigma2: [N_s, 1] variance (uncertainty)
-            embeddings: [N_s, H] final embeddings
-        """
-        # Get embeddings (deterministic)
-        with torch.no_grad():
-            stock_h = self.stock_encoder(stock_features)
-            macro_h = self.macro_encoder(macro_features)
-            
-            stock_stock_edges, edge_weights = self.graph_learner(
-                stock_h, return_weights=True
-            )
-            
-            if macro_stock_edges is None:
-                N_m, N_s = macro_features.size(0), stock_features.size(0)
-                src = torch.arange(N_m, device=stock_features.device).repeat_interleave(N_s)
-                dst = torch.arange(N_s, device=stock_features.device).repeat(N_m)
-                macro_stock_edges = torch.stack([src, dst], dim=0)
-            
-            h = stock_h
-            for mp_layer, ln in zip(self.mp_layers, self.layer_norms):
-                h_new = mp_layer(
-                    stock_h=h,
-                    macro_h=macro_h,
-                    stock_stock_edge_index=stock_stock_edges,
-                    macro_stock_edge_index=macro_stock_edges,
-                    stock_stock_edge_weight=edge_weights
-                )
-                h = ln(h + h_new)
-        
-        # MC Dropout sampling
-        mu, sigma2 = self.output_head.mc_forward(h, n_samples=n_samples)
-        
-        return mu, sigma2, h
+        return direction_logits, magnitude_preds
