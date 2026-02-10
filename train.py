@@ -345,13 +345,15 @@ def save_backtest_summary(all_fold_results: List[Dict], output_dir: str, dates=N
     print(f"\nSaved backtest summary: {filepath}")
 
 
-def main(use_real_data: bool = False):
+def main(use_real_data: bool = False, start_fold: int = 1, end_fold: Optional[int] = None):
     """
     Training loop with optional real data support.
     
     Args:
         use_real_data: If True, load data from ./data/processed/
                        If False, use synthetic random data
+        start_fold: First fold to run (1-based index)
+        end_fold: Last fold to run (1-based index, inclusive). If None, run all.
     """
     # Hyperparameters
     STOCK_DIM = 8  # ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
@@ -360,7 +362,7 @@ def main(use_real_data: bool = False):
     WINDOW_SIZE = 60
     NUM_EPOCHS = 100
     LR = 1e-3
-    WEIGHT_DECAY = 1e-4
+    WEIGHT_DECAY = 1e-2  # Stronger regularization
     
     # Walk-forward parameters (only used with real data)
     TRAIN_SIZE = 200  # ~10 months
@@ -423,8 +425,8 @@ def main(use_real_data: bool = False):
         mp_layers=2,
         heads=4,
         top_k=min(10, NUM_STOCKS - 1),  # Ensure top_k < num_stocks
-        dropout=0.1,
-        mc_dropout=0.3
+        dropout=0.4,
+        mc_dropout=0.4
     ).to(device)
     
     # Loss
@@ -438,6 +440,14 @@ def main(use_real_data: bool = False):
     all_fold_results = []
     
     for fold_idx, (train_data, val_data) in enumerate(folds):
+        current_fold_num = fold_idx + 1
+        
+        # Skip folds outside requested range
+        if current_fold_num < start_fold:
+            continue
+        if end_fold is not None and current_fold_num > end_fold:
+            break
+            
         print(f"\n{'='*60}")
         print(f"FOLD {fold_idx + 1}/{len(folds)}")
         print(f"{'='*60}")
@@ -541,6 +551,23 @@ if __name__ == "__main__":
         help="Use real market data from ./data/processed/ instead of synthetic data"
     )
     
+    parser.add_argument(
+        "--start-fold",
+        type=int,
+        default=1,
+        help="Start fold index (1-based, default: 1)"
+    )
+    parser.add_argument(
+        "--end-fold",
+        type=int,
+        default=None,
+        help="End fold index (1-based, inclusive, default: All)"
+    )
+    
     args = parser.parse_args()
-    main(use_real_data=args.real_data)
+    main(
+        use_real_data=args.real_data,
+        start_fold=args.start_fold,
+        end_fold=args.end_fold
+    )
 

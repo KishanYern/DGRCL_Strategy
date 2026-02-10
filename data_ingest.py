@@ -120,6 +120,9 @@ def process_ticker_data(ticker, is_macro=False):
         return None
 
 def main():
+    if os.path.exists(PROCESSED_DIR):
+        import shutil
+        shutil.rmtree(PROCESSED_DIR)
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     
     # 1. Fetch Macro Data
@@ -138,12 +141,19 @@ def main():
     
     stock_data = {}
     
+    MAX_HISTORY = 1000  # Require ~4 years of data to avoid recent IPOs truncating common range
+    
     # For PoC, limit to first 50 to save time/bandwidth, remove slice [:] for full run
-    for ticker in tickers[:50]: 
+    for ticker in tickers: 
         df = process_ticker_data(ticker, is_macro=False)
-        if df is not None and len(df) > 200:  # Ensure enough history
-            stock_data[ticker] = df
-            print(f"Processed {ticker} - {len(df)} rows")
+        if df is not None:
+            if len(df) > MAX_HISTORY:
+                stock_data[ticker] = df
+                if len(stock_data) % 50 == 0:
+                    print(f"Processed {ticker} - {len(df)} rows")
+            else:
+                # print(f"Skipping {ticker}: Insufficient history ({len(df)} < {MAX_HISTORY})")
+                pass
     
     # 3. CRITICAL: Align all dataframes to common date index
     # Different tickers have different histories (VIX needs 200 days for MA_200)
@@ -167,15 +177,37 @@ def main():
     if len(common_index) < 200:
         print("WARNING: Common date range is very short. Consider using fewer macro indicators or longer history.")
     
+    # 3.5 Cross-Sectional Mean Subtraction (Market Neutrality)
+    print("\nApplying Cross-Sectional Mean Subtraction to Returns...")
+    # Create temporary DataFrame of just returns aligned to common index
+    clean_stock_data = {}
+    for ticker, df in stock_data.items():
+        clean_stock_data[ticker] = df.loc[common_index]
+    
+    # Extract returns matrix [Time, Stocks]
+    returns_matrix = pd.DataFrame({
+        ticker: df['Returns'] 
+        for ticker, df in clean_stock_data.items()
+    })
+    
+    # Calculate cross-sectional mean (market return proxy)
+    market_return = returns_matrix.mean(axis=1)
+    
+    # Subtract market return from each stock
+    for ticker in clean_stock_data:
+        clean_stock_data[ticker]['Returns'] -= market_return
+        
+    print("Returns are now market-neutral (cross-sectional mean subtracted).")
+    
     # 4. Align and save all data
     for name, df in macro_data.items():
         aligned_df = df.loc[common_index]
         aligned_df.to_csv(f"{PROCESSED_DIR}/macro_{name}.csv")
     
     valid_stocks = []
-    for ticker, df in stock_data.items():
-        aligned_df = df.loc[common_index]
-        aligned_df.to_csv(f"{PROCESSED_DIR}/stock_{ticker}.csv")
+    for ticker, df in clean_stock_data.items():
+        # df is already aligned and demeaned
+        df.to_csv(f"{PROCESSED_DIR}/stock_{ticker}.csv")
         valid_stocks.append(ticker)
     
     # Save common index for reference
