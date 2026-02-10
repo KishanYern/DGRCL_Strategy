@@ -527,6 +527,9 @@ class MacroDGRCL(nn.Module):
             num_layers=temporal_layers,
             dropout=dropout
         )
+
+        # Embedding Normalization
+        self.embedding_norm = nn.LayerNorm(hidden_dim)
         
         # Dynamic Graph Learner
         self.graph_learner = DynamicGraphLearner(
@@ -581,6 +584,10 @@ class MacroDGRCL(nn.Module):
         # 1. Temporal Encoding
         stock_h = self.stock_encoder(stock_features)  # [N_s, H]
         macro_h = self.macro_encoder(macro_features)  # [N_m, H]
+
+        # Normalize embeddings
+        stock_h = self.embedding_norm(stock_h)
+        macro_h = self.embedding_norm(macro_h)
         
         # 2. Dynamic Graph Learning (Stock→Stock)
         stock_stock_edges, edge_weights = self.graph_learner(

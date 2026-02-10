@@ -44,6 +44,6 @@ execution:
               size: 1.0
 
     risk_management:
-        holding_period: 1 # Day
+        holding_period: 5 # Days
         net_exposure: "Dollar Neutral"
         order_type: "MOC" # Market On Close

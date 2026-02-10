@@ -98,7 +98,7 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     bce_loss_fn: nn.BCEWithLogitsLoss,
     mse_loss_fn: nn.MSELoss,
-    mag_weight: float = 1.0,
+    mag_weight: float = 0.1,
     macro_stock_edges: Optional[torch.Tensor] = None,
     max_grad_norm: float = 1.0
 ) -> Dict[str, float]:
@@ -192,7 +192,7 @@ def train_epoch(
     bce_loss_fn: nn.BCEWithLogitsLoss,
     mse_loss_fn: nn.MSELoss,
     device: torch.device,
-    mag_weight: float = 1.0,
+    mag_weight: float = 0.1,
     max_grad_norm: float = 1.0
 ) -> Dict[str, float]:
     """
@@ -254,7 +254,7 @@ def evaluate(
     bce_loss_fn: nn.BCEWithLogitsLoss,
     mse_loss_fn: nn.MSELoss,
     device: torch.device,
-    mag_weight: float = 1.0,
+    mag_weight: float = 0.1,
 ) -> Dict[str, float]:
     """
     Evaluate model on validation data with multi-task metrics.
@@ -627,7 +627,7 @@ def main(
     use_real_data: bool = False,
     start_fold: int = 1,
     end_fold: Optional[int] = None,
-    mag_weight: float = 1.0,
+    mag_weight: float = 0.1,
     force_cpu: bool = False
 ):
     """
@@ -708,7 +708,7 @@ def main(
     
     # Loss functions (shared across folds)
     bce_loss_fn = nn.BCEWithLogitsLoss()
-    mse_loss_fn = nn.MSELoss()
+    mse_loss_fn = nn.SmoothL1Loss()
     
     # Load any previously completed fold results for resume
     all_fold_results = []
@@ -942,7 +942,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mag-weight",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Weight λ for magnitude loss (default: 1.0)"
     )
     
