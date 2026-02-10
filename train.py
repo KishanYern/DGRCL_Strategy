@@ -355,6 +355,141 @@ def create_sequential_snapshots(
     return snapshots
 
 
+def mc_dropout_inference(
+    model: MacroDGRCL,
+    stock_features: torch.Tensor,
+    macro_features: torch.Tensor,
+    n_samples: int = 10,
+    macro_stock_edges: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Monte Carlo Dropout inference for uncertainty estimation.
+    
+    Runs n_samples stochastic forward passes with dropout enabled,
+    then computes mean prediction and confidence (inverse of std).
+    
+    Args:
+        model: MacroDGRCL model
+        stock_features: [N_s, T, d_s]
+        macro_features: [N_m, T, d_m]
+        n_samples: Number of stochastic forward passes
+        macro_stock_edges: Optional fixed edges
+        
+    Returns:
+        Dict with keys:
+            dir_prob_mean: [N_s] mean P(up) across samples
+            dir_prob_std:  [N_s] std of P(up) — uncertainty
+            mag_mean:      [N_s] mean magnitude prediction
+            mag_std:       [N_s] std of magnitude prediction
+            confidence:    [N_s] 1/(1+std) — higher = more confident
+    """
+    model.train()  # Keep dropout active
+    
+    dir_probs_all = []
+    mag_preds_all = []
+    
+    with torch.no_grad():
+        for _ in range(n_samples):
+            dir_logits, mag_preds = model(
+                stock_features=stock_features,
+                macro_features=macro_features,
+                macro_stock_edges=macro_stock_edges
+            )
+            dir_probs_all.append(torch.sigmoid(dir_logits.squeeze(-1)))  # [N_s]
+            mag_preds_all.append(mag_preds.squeeze(-1))  # [N_s]
+    
+    # Stack: [n_samples, N_s]
+    dir_probs_stack = torch.stack(dir_probs_all, dim=0)
+    mag_preds_stack = torch.stack(mag_preds_all, dim=0)
+    
+    dir_prob_mean = dir_probs_stack.mean(dim=0)
+    dir_prob_std = dir_probs_stack.std(dim=0)
+    mag_mean = mag_preds_stack.mean(dim=0)
+    mag_std = mag_preds_stack.std(dim=0)
+    
+    # Confidence: inverse of combined uncertainty
+    confidence = 1.0 / (1.0 + dir_prob_std)
+    
+    model.eval()  # Restore eval mode
+    
+    return {
+        'dir_prob_mean': dir_prob_mean,
+        'dir_prob_std': dir_prob_std,
+        'mag_mean': mag_mean,
+        'mag_std': mag_std,
+        'confidence': confidence,
+    }
+
+
+def save_attention_heatmap(
+    model: MacroDGRCL,
+    stock_features: torch.Tensor,
+    macro_features: torch.Tensor,
+    fold_idx: int,
+    output_dir: str,
+    tickers: Optional[List[str]] = None,
+    max_display: int = 30
+):
+    """
+    Visualize the DynamicGraphLearner attention weights as a heatmap.
+    
+    Shows which stocks attend to which other stocks, revealing whether
+    the learned edges capture meaningful relationships or memorize noise.
+    
+    Args:
+        model: Trained MacroDGRCL model
+        stock_features: [N_s, T, d_s] input features
+        macro_features: [N_m, T, d_m] macro features
+        fold_idx: Current fold number (for filename)
+        output_dir: Directory to save the heatmap
+        tickers: Optional list of ticker names for axis labels
+        max_display: Maximum number of stocks to show (for readability)
+    """
+    model.eval()
+    os.makedirs(output_dir, exist_ok=True)
+    
+    with torch.no_grad():
+        # Get temporal embeddings
+        stock_h = model.stock_encoder(stock_features)  # [N_s, H]
+        
+        # Get attention weights from graph learner
+        edge_index, edge_weights = model.graph_learner(
+            stock_h, return_weights=True
+        )
+    
+    N_s = stock_features.size(0)
+    n_display = min(N_s, max_display)
+    
+    # Build dense attention matrix from sparse edges
+    attn_matrix = torch.zeros(N_s, N_s, device=stock_features.device)
+    src, dst = edge_index
+    attn_matrix[dst, src] = edge_weights  # dst attends to src
+    
+    # Crop to displayable size
+    attn_np = attn_matrix[:n_display, :n_display].cpu().numpy()
+    
+    fig, ax = plt.subplots(figsize=(12, 10))
+    im = ax.imshow(attn_np, cmap='YlOrRd', aspect='auto')
+    ax.set_title(f'Stock→Stock Attention Weights — Fold {fold_idx + 1}', fontsize=14)
+    ax.set_xlabel('Source (attends FROM)', fontsize=12)
+    ax.set_ylabel('Destination (attends TO)', fontsize=12)
+    
+    if tickers and len(tickers) >= n_display:
+        tick_labels = tickers[:n_display]
+        ax.set_xticks(range(n_display))
+        ax.set_yticks(range(n_display))
+        ax.set_xticklabels(tick_labels, rotation=90, fontsize=6)
+        ax.set_yticklabels(tick_labels, fontsize=6)
+    
+    plt.colorbar(im, ax=ax, label='Attention Weight')
+    plt.tight_layout()
+    
+    filepath = os.path.join(output_dir, f'attention_heatmap_fold_{fold_idx + 1}.png')
+    plt.savefig(filepath, dpi=150)
+    plt.close()
+    print(f"  Saved attention heatmap: {filepath}")
+
+
 def save_training_curve(epochs: List[int], losses: List[float], fold_idx: int, output_dir: str):
     """Save training loss curve to file."""
     os.makedirs(output_dir, exist_ok=True)
@@ -492,7 +627,8 @@ def main(
     use_real_data: bool = False,
     start_fold: int = 1,
     end_fold: Optional[int] = None,
-    mag_weight: float = 1.0
+    mag_weight: float = 1.0,
+    force_cpu: bool = False
 ):
     """
     Training loop with Multi-Task Learning.
@@ -503,6 +639,7 @@ def main(
         start_fold: First fold to run (1-based index)
         end_fold: Last fold to run (1-based index, inclusive). If None, run all.
         mag_weight: λ weight for magnitude loss (default 1.0)
+        force_cpu: If True, force CPU mode (avoids GPU memory issues)
     """
     # Hyperparameters
     STOCK_DIM = 8  # ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
@@ -511,9 +648,9 @@ def main(
     WINDOW_SIZE = 60
     NUM_EPOCHS = 100
     LR = 1e-3
-    WEIGHT_DECAY = 1e-2
+    WEIGHT_DECAY = 1e-1
     PATIENCE = 15  # Early stopping patience
-    MAX_STOCKS = 150  # Limit stock universe for 8GB VRAM
+    MAX_STOCKS = 150  # Stock universe size
     
     # Walk-forward parameters (only used with real data)
     TRAIN_SIZE = 200
@@ -524,7 +661,10 @@ def main(
     CHECKPOINT_PATH = os.path.join(VIS_DIR, "fold_results.json")
     
     # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if force_cpu:
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"Magnitude loss weight (λ): {mag_weight}")
     
@@ -595,6 +735,10 @@ def main(
             print(f"\nFold {current_fold_num} already completed (checkpoint), skipping...")
             continue
             
+        # Free GPU memory from previous fold
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         print(f"\n{'='*60}")
         print(f"FOLD {fold_idx + 1}/{len(folds)}")
         print(f"{'='*60}")
@@ -617,8 +761,8 @@ def main(
             mp_layers=2,
             heads=4,
             top_k=min(10, NUM_STOCKS - 1),
-            dropout=0.4,
-            head_dropout=0.4
+            dropout=0.5,
+            head_dropout=0.5
         ).to(device)
         
         optimizer = AdamW(
@@ -739,19 +883,36 @@ def main(
     # Save backtest summary visualization
     save_backtest_summary(all_fold_results, VIS_DIR, dates=dates if use_real_data else None)
     
-    # Quick inference test on last fold
-    print("\nTesting inference on first training snapshot...")
-    model.eval()
+    # MC Dropout inference on last fold
+    print("\nMC Dropout Inference (10 stochastic passes)...")
     test_stock = train_data[0][0].to(device)
     test_macro = train_data[0][1].to(device)
     
-    with torch.no_grad():
-        dir_logits, mag_preds = model(test_stock, test_macro)
+    mc_results = mc_dropout_inference(
+        model=model,
+        stock_features=test_stock,
+        macro_features=test_macro,
+        n_samples=10
+    )
     
-    dir_probs = torch.sigmoid(dir_logits)
-    print(f"Direction probability mean: {dir_probs.mean().item():.4f}")
-    print(f"Magnitude prediction mean:  {mag_preds.mean().item():.4f}")
-    print(f"Magnitude is non-negative:  {(mag_preds >= 0).all().item()}")
+    print(f"  Direction P(up) mean:  {mc_results['dir_prob_mean'].mean().item():.4f}")
+    print(f"  Direction uncertainty:  {mc_results['dir_prob_std'].mean().item():.4f}")
+    print(f"  Magnitude mean:        {mc_results['mag_mean'].mean().item():.4f}")
+    print(f"  Magnitude uncertainty: {mc_results['mag_std'].mean().item():.4f}")
+    print(f"  Confidence mean:       {mc_results['confidence'].mean().item():.4f}")
+    print(f"  Confidence min/max:    {mc_results['confidence'].min().item():.4f} / "
+          f"{mc_results['confidence'].max().item():.4f}")
+    
+    # Attention weight visualization on last fold
+    print("\nGenerating attention heatmap...")
+    save_attention_heatmap(
+        model=model,
+        stock_features=test_stock,
+        macro_features=test_macro,
+        fold_idx=len(folds) - 1,
+        output_dir=VIS_DIR,
+        tickers=tickers if use_real_data else None
+    )
     
     print(f"\nBacktest complete! Results saved to: {VIS_DIR}")
     return all_fold_results
@@ -785,10 +946,17 @@ if __name__ == "__main__":
         help="Weight λ for magnitude loss (default: 1.0)"
     )
     
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU mode (slower but avoids GPU memory issues)"
+    )
+    
     args = parser.parse_args()
     main(
         use_real_data=args.real_data,
         start_fold=args.start_fold,
         end_fold=args.end_fold,
-        mag_weight=args.mag_weight
+        mag_weight=args.mag_weight,
+        force_cpu=args.cpu
     )

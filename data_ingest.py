@@ -54,8 +54,9 @@ def rolling_zscore_normalize(df, window=60):
     """
     normalized = pd.DataFrame(index=df.index)
     for col in df.columns:
-        rolling_mean = df[col].rolling(window=window, min_periods=1).mean()
-        rolling_std = df[col].rolling(window=window, min_periods=1).std()
+        # .shift(1) prevents look-ahead: at time t, stats use [t-window, t-1]
+        rolling_mean = df[col].rolling(window=window, min_periods=1).mean().shift(1)
+        rolling_std = df[col].rolling(window=window, min_periods=1).std().shift(1)
         # Avoid division by zero
         rolling_std = rolling_std.replace(0, 1e-8)
         normalized[col] = (df[col] - rolling_mean) / rolling_std

@@ -32,18 +32,23 @@ from macro_dgrcl import (
 
 @pytest.fixture
 def device():
-    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Force CPU for unit tests to avoid GPU OOM on memory-constrained systems.
+    # Architecture is device-agnostic; correctness is identical on CPU vs GPU.
+    return torch.device('cpu')
 
 
 @pytest.fixture
 def sample_data():
     """Generate sample data for testing."""
-    N_s = 50  # Number of stocks
+    # Reduced sizes to prevent OOM on memory-constrained GPUs.
+    # Architecture is identical — same layer types, heads, forward logic.
+    # Only input counts are smaller (N_s 50→10 eliminates O(N²) attention bottleneck).
+    N_s = 10  # Number of stocks (reduced from 50)
     N_m = 4   # Number of macro factors
-    T = 60    # Sequence length
+    T = 20    # Sequence length (reduced from 60)
     d_s = 8   # Stock feature dim (v1.3: 8 features)
     d_m = 4   # Macro feature dim
-    H = 64    # Hidden dim
+    H = 32    # Hidden dim (reduced from 64)
     
     return {
         'stock_features': torch.randn(N_s, T, d_s),
@@ -150,9 +155,10 @@ class TestDynamicGraphLearner:
     
     def test_output_shapes(self, sample_data):
         """Test edge_index shape."""
+        top_k = 10
         learner = DynamicGraphLearner(
             hidden_dim=sample_data['H'],
-            top_k=10
+            top_k=top_k
         )
         
         edge_index, edge_weight = learner(
@@ -160,12 +166,14 @@ class TestDynamicGraphLearner:
             return_weights=True
         )
         
-        expected_edges = sample_data['N_s'] * 10
+        # top_k is clamped to N-1 inside forward()
+        effective_k = min(top_k, sample_data['N_s'] - 1)
+        expected_edges = sample_data['N_s'] * effective_k
         assert edge_index.shape == (2, expected_edges)
         assert edge_weight.shape == (expected_edges,)
     
     def test_top_k_sparsity(self, sample_data):
-        """Test that each node has exactly top_k neighbors."""
+        """Test that each node RECEIVES from exactly top_k neighbors."""
         top_k = 5
         learner = DynamicGraphLearner(
             hidden_dim=sample_data['H'],
@@ -174,9 +182,11 @@ class TestDynamicGraphLearner:
         
         edge_index, _ = learner(sample_data['stock_embeddings'])
         
-        src = edge_index[0]
-        unique, counts = torch.unique(src, return_counts=True)
-        assert (counts == top_k).all()
+        # Each destination node selects exactly k neighbors to receive from
+        effective_k = min(top_k, sample_data['N_s'] - 1)
+        dst = edge_index[1]
+        unique, counts = torch.unique(dst, return_counts=True)
+        assert (counts == effective_k).all()
     
     def test_dynamic_changes_with_embeddings(self, sample_data):
         """Test that different embeddings produce different graphs."""
@@ -292,10 +302,10 @@ class TestMultiTaskHead:
             dropout=0.0
         )
         
-        # Collect logits from multiple random inputs
+        # Collect logits from multiple random inputs with large magnitude
         all_logits = []
-        for _ in range(20):
-            x = torch.randn(sample_data['N_s'], sample_data['H']) * 3
+        for _ in range(50):
+            x = torch.randn(sample_data['N_s'], sample_data['H']) * 10
             dir_logits, _ = head(x)
             all_logits.append(dir_logits)
         
@@ -610,6 +620,102 @@ class TestEndToEnd:
         # but total loss should clearly differ due to mag_weight
         assert abs(m1['loss_dir'] - m2['loss_dir']) < 0.05
         assert m1['loss'] != m2['loss']
+
+
+# =============================================================================
+# TEST: MC DROPOUT INFERENCE
+# =============================================================================
+
+class TestMCDropout:
+    
+    def test_mc_dropout_variance(self, sample_data, device):
+        """MC Dropout must produce non-zero variance (dropout is active)."""
+        from train import mc_dropout_inference
+        
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H'],
+            dropout=0.5,
+            head_dropout=0.5
+        ).to(device)
+        
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        
+        results = mc_dropout_inference(
+            model, stock_feat, macro_feat, n_samples=20
+        )
+        
+        # With dropout=0.5 and 20 samples, std should be non-zero
+        assert results['dir_prob_std'].mean().item() > 0, \
+            "MC Dropout should produce non-zero variance in direction predictions"
+        assert results['mag_std'].mean().item() > 0, \
+            "MC Dropout should produce non-zero variance in magnitude predictions"
+    
+    def test_mc_dropout_output_shapes(self, sample_data, device):
+        """MC Dropout returns correct shapes for all outputs."""
+        from train import mc_dropout_inference
+        
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        
+        results = mc_dropout_inference(
+            model, stock_feat, macro_feat, n_samples=5
+        )
+        
+        N_s = sample_data['N_s']
+        assert results['dir_prob_mean'].shape == (N_s,)
+        assert results['dir_prob_std'].shape == (N_s,)
+        assert results['mag_mean'].shape == (N_s,)
+        assert results['mag_std'].shape == (N_s,)
+        assert results['confidence'].shape == (N_s,)
+        
+        # Confidence should be in (0, 1]
+        assert (results['confidence'] > 0).all()
+        assert (results['confidence'] <= 1).all()
+
+
+# =============================================================================
+# TEST: ROLLING Z-SCORE NO LOOK-AHEAD
+# =============================================================================
+
+class TestRollingZScore:
+    
+    def test_no_lookahead(self):
+        """Modifying future values must not change past normalized values."""
+        import pandas as pd
+        from data_ingest import rolling_zscore_normalize
+        
+        # Create a deterministic series
+        dates = pd.date_range('2020-01-01', periods=100, freq='D')
+        df1 = pd.DataFrame({'A': range(100)}, index=dates, dtype=float)
+        df2 = df1.copy()
+        
+        # Modify future values (from index 50 onward)
+        df2.loc[df2.index[50]:, 'A'] = 9999.0
+        
+        norm1 = rolling_zscore_normalize(df1, window=10)
+        norm2 = rolling_zscore_normalize(df2, window=10)
+        
+        # All normalized values BEFORE the modification point should be identical
+        # (checking up to index 49, since shift(1) means index 50 uses data up to 49)
+        pd.testing.assert_frame_equal(
+            norm1.iloc[1:50],  # skip first row (NaN from shift)
+            norm2.iloc[1:50],
+            check_names=True,
+            obj="No look-ahead: past values should be identical"
+        )
 
 
 if __name__ == "__main__":
