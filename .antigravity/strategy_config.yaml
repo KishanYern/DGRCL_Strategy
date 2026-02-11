@@ -12,7 +12,7 @@ model:
         lookback_window: 30 # Days
         prediction_horizon: 1 # Day
         batch_size: 32
-        learning_rate: 0.001
+        learning_rate: 0.0001
         loss_function: "PairwiseRankingLoss"
         contrastive_weight: 0.1
         epochs: 100

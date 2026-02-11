@@ -647,7 +647,7 @@ def main(
     HIDDEN_DIM = 64
     WINDOW_SIZE = 60
     NUM_EPOCHS = 100
-    LR = 1e-3
+    LR = 1e-4
     WEIGHT_DECAY = 1e-1
     PATIENCE = 15  # Early stopping patience
     MAX_STOCKS = 150  # Stock universe size
@@ -760,7 +760,7 @@ def main(
             temporal_layers=2,
             mp_layers=2,
             heads=4,
-            top_k=min(10, NUM_STOCKS - 1),
+            top_k=min(5, NUM_STOCKS - 1),
             dropout=0.5,
             head_dropout=0.5
         ).to(device)
