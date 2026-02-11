@@ -10,7 +10,7 @@ model:
         dropout: 0.3 # Critical for MC Dropout
     training:
         lookback_window: 30 # Days
-        prediction_horizon: 1 # Day
+        prediction_horizon: 5 # Day
         batch_size: 32
         learning_rate: 0.0001
         loss_function: "PairwiseRankingLoss"

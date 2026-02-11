@@ -90,6 +90,10 @@ class EarlyStopping:
 # TRAINING STEP
 # =============================================================================
 
+# =============================================================================
+# TRAINING STEP
+# =============================================================================
+
 def train_step(
     model: MacroDGRCL,
     stock_features: torch.Tensor,  # [N_s, T, d_s]
@@ -100,14 +104,16 @@ def train_step(
     mse_loss_fn: nn.MSELoss,
     mag_weight: float = 0.1,
     macro_stock_edges: Optional[torch.Tensor] = None,
+    sector_mask: Optional[torch.Tensor] = None,
+    sector_ids: Optional[torch.Tensor] = None,
     max_grad_norm: float = 1.0
 ) -> Dict[str, float]:
     """
     Single training step with Multi-Task Learning.
     
     Target Engineering:
-        dir_target = (returns > median(returns)).float()   → binary {0, 1}
-        mag_target = |returns|                             → positive continuous
+        dir_target = (returns > Sector_Median(returns)).float()   → binary {0, 1}
+        mag_target = |returns|                                    → positive continuous
     
     Loss:
         L_total = L_BCE(dir_logits, dir_target) + λ · L_MSE(mag_preds, mag_target)
@@ -122,6 +128,8 @@ def train_step(
         mse_loss_fn: MSELoss for magnitude
         mag_weight: λ weight for magnitude loss
         macro_stock_edges: Optional fixed macro→stock edges
+        sector_mask: [N_s, N_s] boolean mask for attention
+        sector_ids: [N_s] integer sector IDs for target generation
         max_grad_norm: Gradient clipping threshold
         
     Returns:
@@ -131,11 +139,35 @@ def train_step(
     optimizer.zero_grad()
     
     # --- Target Engineering ---
-    # Direction: top half of cross-sectional returns = 1, bottom half = 0
-    # Rank-based to guarantee balanced classes regardless of ties
-    N_s = returns.size(0)
-    ranks = returns.argsort().argsort().float()
-    dir_target = (ranks >= N_s / 2).float()  # [N_s]
+    # Direction: Return > Sector Median ? 1 : 0
+    # This neutralizes sector beta and forces relative value learning.
+    
+    if sector_ids is not None:
+        # Compute median return per sector
+        unique_sectors = torch.unique(sector_ids)
+        dir_target = torch.zeros_like(returns)
+        
+        for s_id in unique_sectors:
+            mask = (sector_ids == s_id)
+            sector_returns = returns[mask]
+            
+            if len(sector_returns) > 1:
+                # Calculate median for this sector
+                median_val = sector_returns.median()
+                # 1 if > median, 0 otherwise
+                dir_target[mask] = (sector_returns > median_val).float()
+            else:
+                # If only 1 stock in sector, can't compute relative value
+                # Fallback to global 0 (hold) or ignore? 
+                # Let's set to 0.5 (uncertain) -> binary 0 or 1 arbitrarily?
+                # Actually, standard practice is to exclude or set to 0.
+                dir_target[mask] = 0.0 # Default to SELL/HOLD
+                
+    else:
+        # Fallback to Global Median if no sectors provided (Backward Compatibility)
+        N_s = returns.size(0)
+        ranks = returns.argsort().argsort().float()
+        dir_target = (ranks >= N_s / 2).float()  # [N_s]
     
     # Magnitude: absolute return
     mag_target = torch.abs(returns)  # [N_s]
@@ -144,7 +176,8 @@ def train_step(
     dir_logits, mag_preds = model(
         stock_features=stock_features,
         macro_features=macro_features,
-        macro_stock_edges=macro_stock_edges
+        macro_stock_edges=macro_stock_edges,
+        sector_mask=sector_mask
     )
     
     # --- Loss computation ---
@@ -193,7 +226,9 @@ def train_epoch(
     mse_loss_fn: nn.MSELoss,
     device: torch.device,
     mag_weight: float = 0.1,
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1.0,
+    sector_mask: Optional[torch.Tensor] = None,
+    sector_ids: Optional[torch.Tensor] = None
 ) -> Dict[str, float]:
     """
     Train for one epoch over sequential snapshots.
@@ -207,6 +242,8 @@ def train_epoch(
         device: Torch device
         mag_weight: λ for magnitude loss
         max_grad_norm: Gradient clipping threshold
+        sector_mask: [N_s, N_s] boolean mask
+        sector_ids: [N_s] sector IDs
         
     Returns:
         Dict with epoch-level metrics (averaged across batches)
@@ -217,6 +254,12 @@ def train_epoch(
         'dir_accuracy': 0.0, 'mag_mae': 0.0
     }
     num_batches = 0
+    
+    # Ensure masks are on device
+    if sector_mask is not None:
+        sector_mask = sector_mask.to(device)
+    if sector_ids is not None:
+        sector_ids = sector_ids.to(device)
     
     for stock_feat, macro_feat, returns in data_loader:
         stock_feat = stock_feat.to(device)
@@ -232,7 +275,9 @@ def train_epoch(
             bce_loss_fn=bce_loss_fn,
             mse_loss_fn=mse_loss_fn,
             mag_weight=mag_weight,
-            max_grad_norm=max_grad_norm
+            max_grad_norm=max_grad_norm,
+            sector_mask=sector_mask,
+            sector_ids=sector_ids
         )
         
         for key in epoch_metrics:
@@ -255,6 +300,8 @@ def evaluate(
     mse_loss_fn: nn.MSELoss,
     device: torch.device,
     mag_weight: float = 0.1,
+    sector_mask: Optional[torch.Tensor] = None,
+    sector_ids: Optional[torch.Tensor] = None
 ) -> Dict[str, float]:
     """
     Evaluate model on validation data with multi-task metrics.
@@ -266,6 +313,8 @@ def evaluate(
         mse_loss_fn: MSELoss
         device: Torch device
         mag_weight: λ for magnitude loss
+        sector_mask: [N_s, N_s] boolean mask
+        sector_ids: [N_s] sector IDs
         
     Returns:
         Dict with evaluation metrics
@@ -277,21 +326,41 @@ def evaluate(
     }
     num_batches = 0
     
+    if sector_mask is not None:
+        sector_mask = sector_mask.to(device)
+    if sector_ids is not None:
+        sector_ids = sector_ids.to(device)
+    
     for stock_feat, macro_feat, returns in data_loader:
         stock_feat = stock_feat.to(device)
         macro_feat = macro_feat.to(device)
         returns = returns.to(device)
         
-        # Target engineering (same as training — rank-based)
-        N_s = returns.size(0)
-        ranks = returns.argsort().argsort().float()
-        dir_target = (ranks >= N_s / 2).float()
+        # Target engineering (Sector-Neutral)
+        if sector_ids is not None:
+            unique_sectors = torch.unique(sector_ids)
+            dir_target = torch.zeros_like(returns)
+            for s_id in unique_sectors:
+                mask = (sector_ids == s_id)
+                sector_returns = returns[mask]
+                if len(sector_returns) > 1:
+                    median_val = sector_returns.median()
+                    dir_target[mask] = (sector_returns > median_val).float()
+                else:
+                    dir_target[mask] = 0.0
+        else:
+            # Fallback
+            N_s = returns.size(0)
+            ranks = returns.argsort().argsort().float()
+            dir_target = (ranks >= N_s / 2).float()
+            
         mag_target = torch.abs(returns)
         
         # Forward pass
         dir_logits, mag_preds = model(
             stock_features=stock_feat,
-            macro_features=macro_feat
+            macro_features=macro_feat,
+            sector_mask=sector_mask
         )
         
         # Losses
@@ -649,7 +718,7 @@ def main(
     NUM_EPOCHS = 100
     LR = 1e-4
     WEIGHT_DECAY = 1e-1
-    PATIENCE = 15  # Early stopping patience
+    PATIENCE = 25  # Early stopping patience
     MAX_STOCKS = 150  # Stock universe size
     
     # Walk-forward parameters (only used with real data)
@@ -672,7 +741,8 @@ def main(
         from data_loader import load_and_prepare_backtest
         
         print("\n=== Loading Real Market Data ===")
-        folds, dates, tickers, NUM_STOCKS, NUM_MACROS = load_and_prepare_backtest(
+        # v1.4: Now returns sector_map
+        folds, dates, tickers, NUM_STOCKS, NUM_MACROS, sector_map = load_and_prepare_backtest(
             data_dir="./data/processed",
             train_size=TRAIN_SIZE,
             val_size=VAL_SIZE,
@@ -680,6 +750,7 @@ def main(
             window_size=WINDOW_SIZE,
             forecast_horizon=5,
             snapshot_step=1,
+            macro_lag=5,  # v1.4: Explicit macro lagging
             device=torch.device('cpu'),
             max_stocks=MAX_STOCKS
         )
@@ -687,6 +758,29 @@ def main(
         print(f"\nReady for walk-forward backtest:")
         print(f"  {len(folds)} folds, {NUM_STOCKS} stocks, {NUM_MACROS} macro factors")
         
+        # v1.4: Initialize Graph Builder with Sector Info
+        from macro_dgrcl import HeteroGraphBuilder
+        graph_builder = HeteroGraphBuilder(
+            sector_mapping=sector_map,
+            tickers=tickers
+        )
+        # Precompute sector mask [N, N] and IDs [N]
+        # We need these on the correct device later
+        sector_mask = graph_builder.sector_mask
+        
+        # Convert sector mapping to integer IDs for target generation
+        # tickers is list of strings
+        # sector_map is dict {ticker: sector_name}
+        if sector_map and tickers:
+            unique_sectors = sorted(list(set(sector_map.values())))
+            sector_to_id = {s: i for i, s in enumerate(unique_sectors)}
+            sector_ids_list = [sector_to_id.get(sector_map.get(t, "Unknown"), -1) for t in tickers]
+            sector_ids = torch.tensor(sector_ids_list, dtype=torch.long)
+            print(f"  Sector constraints enabled. Found {len(unique_sectors)} sectors.")
+        else:
+            sector_ids = None
+            print("  No sector mapping found. Running in sector-agnostic mode.")
+            
     else:
         NUM_STOCKS = 50
         NUM_MACROS = 4
@@ -705,6 +799,10 @@ def main(
         )
         folds = [(train_data, [])]
         print(f"Created {len(train_data)} training snapshots (synthetic)")
+        
+        # No sector constraints for synthetic data
+        sector_mask = None
+        sector_ids = None
     
     # Loss functions (shared across folds)
     bce_loss_fn = nn.BCEWithLogitsLoss()
@@ -784,7 +882,9 @@ def main(
                 bce_loss_fn=bce_loss_fn,
                 mse_loss_fn=mse_loss_fn,
                 device=device,
-                mag_weight=mag_weight
+                mag_weight=mag_weight,
+                sector_mask=sector_mask,
+                sector_ids=sector_ids
             )
             epoch_losses.append(metrics['loss'])
             
@@ -806,7 +906,9 @@ def main(
                     bce_loss_fn=bce_loss_fn,
                     mse_loss_fn=mse_loss_fn,
                     device=device,
-                    mag_weight=mag_weight
+                    mag_weight=mag_weight,
+                    sector_mask=sector_mask,
+                    sector_ids=sector_ids
                 )
                 if early_stopping(val_metrics['loss'], model):
                     print(f"  Early stopping at epoch {epoch+1} "
@@ -831,7 +933,9 @@ def main(
                 bce_loss_fn=bce_loss_fn,
                 mse_loss_fn=mse_loss_fn,
                 device=device,
-                mag_weight=mag_weight
+                mag_weight=mag_weight,
+                sector_mask=sector_mask,
+                sector_ids=sector_ids
             )
             print(f"  Val Loss: {val_metrics['loss']:.4f} "
                   f"(Dir: {val_metrics['loss_dir']:.4f}, Mag: {val_metrics['loss_mag']:.4f})")
@@ -866,7 +970,7 @@ def main(
     
     # Summary
     print(f"\n{'='*60}")
-    print("BACKTEST SUMMARY (v1.3 Multi-Task)")
+    print("BACKTEST SUMMARY (v1.4 Multi-Task Sector-Aware)")
     print(f"{'='*60}")
     
     val_losses = [r['val_loss'] for r in all_fold_results if r['val_loss'] is not None]
@@ -883,36 +987,40 @@ def main(
     # Save backtest summary visualization
     save_backtest_summary(all_fold_results, VIS_DIR, dates=dates if use_real_data else None)
     
-    # MC Dropout inference on last fold
-    print("\nMC Dropout Inference (10 stochastic passes)...")
-    test_stock = train_data[0][0].to(device)
-    test_macro = train_data[0][1].to(device)
-    
-    mc_results = mc_dropout_inference(
-        model=model,
-        stock_features=test_stock,
-        macro_features=test_macro,
-        n_samples=10
-    )
-    
-    print(f"  Direction P(up) mean:  {mc_results['dir_prob_mean'].mean().item():.4f}")
-    print(f"  Direction uncertainty:  {mc_results['dir_prob_std'].mean().item():.4f}")
-    print(f"  Magnitude mean:        {mc_results['mag_mean'].mean().item():.4f}")
-    print(f"  Magnitude uncertainty: {mc_results['mag_std'].mean().item():.4f}")
-    print(f"  Confidence mean:       {mc_results['confidence'].mean().item():.4f}")
-    print(f"  Confidence min/max:    {mc_results['confidence'].min().item():.4f} / "
-          f"{mc_results['confidence'].max().item():.4f}")
-    
-    # Attention weight visualization on last fold
-    print("\nGenerating attention heatmap...")
-    save_attention_heatmap(
-        model=model,
-        stock_features=test_stock,
-        macro_features=test_macro,
-        fold_idx=len(folds) - 1,
-        output_dir=VIS_DIR,
-        tickers=tickers if use_real_data else None
-    )
+    # MC Dropout inference on last fold (only if model exists)
+    if 'model' in locals():
+        print("\nMC Dropout Inference (10 stochastic passes)...")
+        test_stock = train_data[0][0].to(device)
+        test_macro = train_data[0][1].to(device)
+        
+        mc_results = mc_dropout_inference(
+            model=model,
+            stock_features=test_stock,
+            macro_features=test_macro,
+            n_samples=10,
+            macro_stock_edges=None  # Can be passed if we had fixed edges
+        )
+        
+        print(f"  Direction P(up) mean:  {mc_results['dir_prob_mean'].mean().item():.4f}")
+        print(f"  Direction uncertainty:  {mc_results['dir_prob_std'].mean().item():.4f}")
+        print(f"  Magnitude mean:        {mc_results['mag_mean'].mean().item():.4f}")
+        print(f"  Magnitude uncertainty: {mc_results['mag_std'].mean().item():.4f}")
+        print(f"  Confidence mean:       {mc_results['confidence'].mean().item():.4f}")
+        print(f"  Confidence min/max:    {mc_results['confidence'].min().item():.4f} / "
+              f"{mc_results['confidence'].max().item():.4f}")
+        
+        # Attention weight visualization on last fold
+        print("\nGenerating attention heatmap...")
+        save_attention_heatmap(
+            model=model,
+            stock_features=test_stock,
+            macro_features=test_macro,
+            fold_idx=len(folds) - 1,
+            output_dir=VIS_DIR,
+            tickers=tickers if use_real_data else None
+        )
+    else:
+        print("\nNo model trained (all folds skipped). Skipping inference.")
     
     print(f"\nBacktest complete! Results saved to: {VIS_DIR}")
     return all_fold_results
@@ -921,7 +1029,7 @@ def main(
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Train Macro-DGRCL v1.3 (Multi-Task)")
+    parser = argparse.ArgumentParser(description="Train Macro-DGRCL v1.4 (Sector-Aware)")
     parser.add_argument(
         "--real-data",
         action="store_true",

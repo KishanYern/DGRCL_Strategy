@@ -218,6 +218,7 @@ class WalkForwardSplitter:
         return len(self.split(total_days))
 
 
+
 # =============================================================================
 # BACKTEST FOLD CREATION
 # =============================================================================
@@ -241,7 +242,7 @@ def create_backtest_folds(
     
     Args:
         stock_data: [N_s, Total_T, d_s] full stock time-series
-        macro_data: [N_m, Total_T, d_m] full macro time-series
+        macro_data: [N_m, Total_T, d_m] full macro time-series (already lagged if needed)
         returns_data: [N_s, Total_T] stock returns
         splitter: WalkForwardSplitter instance
         window_size: Lookback window T for each snapshot
@@ -252,6 +253,9 @@ def create_backtest_folds(
         List of (train_snapshots, val_snapshots) tuples, one per fold
     """
     total_t = stock_data.size(1)
+    # Ensure macro data matches stock data length (should be handled by caller)
+    assert macro_data.size(1) == total_t, "Macro and Stock data must have same length"
+    
     folds_data = []
     
     # Get fold boundaries
@@ -330,11 +334,49 @@ def _create_snapshots(
         macro_window = macro_data[:, t:t+window_size, :]  # [N_m, window_size, d_m]
         
         # Future returns as labels (cumulative over forecast horizon)
+        # Target is strictly future return of stock, NOT macro
         future_returns = returns_data[:, t+window_size:t+window_size+forecast_horizon].sum(dim=1)
         
         snapshots.append((stock_window, macro_window, future_returns))
     
     return snapshots
+
+
+# =============================================================================
+# SECTOR MAPPING HELPER
+# =============================================================================
+
+def get_sector_mapping(
+    tickers: List[str],
+    data_dir: str = "./data"
+) -> Dict[str, str]:
+    """
+    Load or generate sector mapping for tickers.
+    If real mapping file exists (ticker_sector_map.csv), use it.
+    Otherwise, generate synthetic GICS sectors for testing.
+    """
+    map_path = os.path.join(data_dir, "ticker_sector_map.csv")
+    
+    if os.path.exists(map_path):
+        df = pd.read_csv(map_path)
+        # Expect columns 'Ticker', 'Sector'
+        if 'Ticker' in df.columns and 'Sector' in df.columns:
+            return pd.Series(df.Sector.values, index=df.Ticker).to_dict()
+    
+    # Fallback: Synthetic Sectors
+    print("Warning: No sector map found. Generating synthetic sectors for testing.")
+    sectors = [
+        'Technology', 'Healthcare', 'Financials', 'Consumer Discretionary',
+        'Communication Services', 'Industrials', 'Consumer Staples',
+        'Energy', 'Utilities', 'Real Estate', 'Materials'
+    ]
+    # Deterministic hash to assign fixed sector per ticker
+    mapping = {}
+    for ticker in tickers:
+        idx = sum(ord(c) for c in ticker) % len(sectors)
+        mapping[ticker] = sectors[idx]
+        
+    return mapping
 
 
 # =============================================================================
@@ -349,18 +391,25 @@ def load_and_prepare_backtest(
     window_size: int = 60,
     forecast_horizon: int = 5,
     snapshot_step: int = 1,
+    macro_lag: int = 5,
     device: torch.device = None,
     max_stocks: Optional[int] = 150
-) -> Tuple[List, pd.DatetimeIndex, List[str], int, int]:
+) -> Tuple[List, pd.DatetimeIndex, List[str], int, int, Dict[str, str]]:
     """
     Convenience function to load data and create backtest folds in one call.
+    Applies explicit MACRO LAGGING to enforce causality.
     
+    Args:
+        macro_lag: Shift macro data forward by N days (default 5).
+                   Stock_t will be aligned with Macro_{t-lag}.
+                   
     Returns:
         folds: List of (train_snapshots, val_snapshots) tuples
         dates: Date index
         tickers: Stock ticker list
         num_stocks: Number of stocks
         num_macros: Number of macro factors
+        sector_map: Dict mapping ticker -> sector_name
     """
     # Load data
     stock_data, macro_data, returns_data, dates, tickers = load_processed_data(
@@ -369,6 +418,30 @@ def load_and_prepare_backtest(
         max_stocks=max_stocks
     )
     
+    # --- APPLY MACRO LAGGING ---
+    if macro_lag > 0:
+        print(f"Applying macro lag of {macro_lag} days for causality...")
+        # Shift macro tensor: Macro at index t becomes Macro at index t+lag
+        # We need to truncate the datasets to keep them aligned in time
+        
+        # New valid time range: [macro_lag, T]
+        # Stock: starts at macro_lag (aligned with Macro_0)
+        # Macro: starts at 0 (represents Macro_-lag relative to new start)
+        
+        # To align Stock_t with Macro_{t-lag}:
+        # New Stock sequence: Stock[macro_lag:]
+        # New Macro sequence: Macro[:-macro_lag]
+        
+        stock_data = stock_data[:, macro_lag:, :]
+        returns_data = returns_data[:, macro_lag:]
+        macro_data = macro_data[:, :-macro_lag, :]
+        dates = dates[macro_lag:]
+        
+        print(f"  Aligned data shape: {stock_data.size(1)} timesteps")
+    
+    # Load sector map
+    sector_map = get_sector_mapping(tickers, data_dir=os.path.dirname(data_dir))
+
     # Create splitter
     splitter = WalkForwardSplitter(
         train_size=train_size,
@@ -387,14 +460,15 @@ def load_and_prepare_backtest(
         step_size=snapshot_step
     )
     
-    return folds, dates, tickers, stock_data.size(0), macro_data.size(0)
+    return folds, dates, tickers, stock_data.size(0), macro_data.size(0), sector_map
 
 
 if __name__ == "__main__":
     # Demo/test loading
     try:
-        folds, dates, tickers, n_stocks, n_macros = load_and_prepare_backtest()
+        folds, dates, tickers, n_stocks, n_macros, sector_map = load_and_prepare_backtest()
         print(f"\nBacktest ready: {len(folds)} folds, {n_stocks} stocks, {n_macros} macro factors")
+        print(f"Sector map loaded for {len(sector_map)} tickers")
     except FileNotFoundError as e:
         print(f"Error: {e}")
         print("Run 'python data_ingest.py' first to generate processed data.")

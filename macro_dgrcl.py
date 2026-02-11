@@ -1,9 +1,9 @@
 """
-Macro-Aware DGRCL v1.3 - Multi-Task Learning Architecture
+Macro-Aware DGRCL v1.4 - Sector-Aware Macro-Lag Architecture
 
 A Heterogeneous Graph Neural Network for market-neutral trading with:
 - Explicit Macro factor nodes (not feature vectors)
-- Dynamic Stock→Stock edge learning via attention
+- Dynamic Stock→Stock edge learning via attention (SECTOR-CONSTRAINED)
 - Hybrid Macro→Stock edges (fixed + learned)
 - Multi-Task Head: Direction (binary) + Magnitude (regression)
 """
@@ -31,22 +31,47 @@ class HeteroGraphBuilder:
     
     Edge Types:
         - ('macro', 'influences', 'stock'): Hybrid (fixed + learned)
-        - ('stock', 'relates', 'stock'): Dynamic via attention
+        - ('stock', 'relates', 'stock'): Dynamic via attention (Sector-Constrained)
     """
     
     def __init__(
         self,
         macro_stock_fixed_edges: Optional[torch.Tensor] = None,
-        sector_mapping: Optional[Dict[int, int]] = None
+        sector_mapping: Optional[Dict[str, str]] = None,
+        tickers: Optional[List[str]] = None
     ):
         """
         Args:
             macro_stock_fixed_edges: [2, E] tensor of fixed macro→stock edges
-            sector_mapping: Dict mapping stock_idx → sector_idx for fixed edges
+            sector_mapping: Dict mapping Ticker → Sector Name
+            tickers: List of tickers corresponding to stock_features indices
         """
         self.macro_stock_fixed_edges = macro_stock_fixed_edges
-        self.sector_mapping = sector_mapping or {}
+        self.sector_mapping = sector_mapping
+        self.tickers = tickers
+        
+        # Precompute sector mask if mapping is provided
+        self.sector_mask = None
+        if sector_mapping and tickers:
+            self._precompute_sector_mask()
     
+    def _precompute_sector_mask(self):
+        """
+        Create a boolean mask [N, N] where Mask[i, j] = True iff Sector[i] == Sector[j].
+        """
+        N = len(self.tickers)
+        sectors = [self.sector_mapping.get(t, "Unknown") for t in self.tickers]
+        
+        # Convert sectors to integer IDs
+        unique_sectors = list(set(sectors))
+        sector_to_id = {s: i for i, s in enumerate(unique_sectors)}
+        sector_ids = torch.tensor([sector_to_id[s] for s in sectors])
+        
+        # Broadcast equality -> [N, N]
+        # mask[i, j] is True if sector_ids[i] == sector_ids[j]
+        self.sector_mask = sector_ids.unsqueeze(0) == sector_ids.unsqueeze(1)
+        print(f"HeteroGraphBuilder: Precomputed sector mask for {N} stocks.")
+
     def build(
         self,
         stock_features: torch.Tensor,  # [N_s, T, d_s]
@@ -168,8 +193,9 @@ class DynamicGraphLearner(nn.Module):
     """
     Computes dynamic adjacency matrix for Stock→Stock edges via attention.
     
-    At each timestep, computes pairwise attention scores and keeps top-k
-    neighbors per node to maintain sparsity.
+    SECTOR-CONSTRAINED:
+    Applies a sector mask to attention scores so that stocks ONLY attend
+    to other stocks in the same sector.
     """
     
     def __init__(
@@ -195,6 +221,7 @@ class DynamicGraphLearner(nn.Module):
     def forward(
         self,
         embeddings: torch.Tensor,  # [N, H]
+        sector_mask: Optional[torch.Tensor] = None, # [N, N] bool
         return_weights: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -202,6 +229,7 @@ class DynamicGraphLearner(nn.Module):
         
         Args:
             embeddings: [N, H] node embeddings
+            sector_mask: [N, N] boolean mask (True = allowed edge)
             return_weights: Whether to return attention weights
             
         Returns:
@@ -222,26 +250,52 @@ class DynamicGraphLearner(nn.Module):
         attention = F.leaky_relu(torch.matmul(concat, self.a), negative_slope=0.2)  # [N, N]
         attention = attention / self.temperature
         
+        # --- APPLY SECTOR MASK ---
+        if sector_mask is not None:
+            # Expand mask to attention shape if needed (though [N,N] should match)
+            if sector_mask.shape != attention.shape:
+               raise ValueError(f"Sector mask shape {sector_mask.shape} mismatch with attention {attention.shape}")
+            
+            # Mask out cross-sector pairs with -inf
+            # kept: mask is True. removed: mask is False.
+            attention = attention.masked_fill(~sector_mask, -1e9)
+
         # Top-k selection per row (each node keeps top-k neighbors)
         k = min(self.top_k, N - 1)
         topk_values, topk_indices = torch.topk(attention, k=k, dim=1)  # [N, k]
+        
+        # Filter out masked edges (values close to -1e9)
+        # This handles the case where k > sector_size
+        valid_mask = topk_values > -1e8  # [N, k]
         
         # Build sparse edge_index
         # CRITICAL: In PyG MessagePassing, info flows src → dst
         # Node i computed which neighbors j are relevant, so i should RECEIVE from j
         # Therefore edges are: src=j (neighbors), dst=i (computing node)
-        row_indices = torch.arange(N, device=embeddings.device).unsqueeze(1).repeat(1, k)  # [N, k]  (node i)
-        col_indices = topk_indices  # [N, k]  (neighbors j that node i selected)
         
-        # Edges: j → i (so node i receives messages from its selected neighbors j)
-        src = col_indices.flatten()  # neighbors j
-        dst = row_indices.flatten()  # node i that selected them
+        # Create row indices [N, k]
+        row_indices = torch.arange(N, device=embeddings.device).unsqueeze(1).repeat(1, k)  # [N, k]
         
-        edge_index = torch.stack([src, dst], dim=0)  # [2, N*k]
+        # Apply filter
+        src_indices = topk_indices[valid_mask]  # neighbors j (flattened)
+        dst_indices = row_indices[valid_mask]   # node i (flattened)
+        
+        # Edges: j → i
+        edge_index = torch.stack([src_indices, dst_indices], dim=0)  # [2, E_valid]
         
         if return_weights:
-            # Normalize weights via softmax over selected neighbors
-            edge_weight = F.softmax(topk_values, dim=1).flatten()  # [N*k]
+            # Normalize weights via softmax over selected neighbors (subset)
+            # We need to re-softmax only over valid edges per node?
+            # Actually, the original softmax was over all N. 
+            # But usually we softmax over the selected neighbors for GAT-style.
+            # Here we just return the raw attention scores (passed through leaky_relu/temp)
+            # The downstream layer applies softmax.
+            
+            # Extract valid values
+            edge_weight = topk_values[valid_mask]
+            
+            # NOTE: The downstream MacroPropagation layer calls softmax(alpha, dst, ...)
+            # So passing raw scores is correct.
             return edge_index, edge_weight
         
         return edge_index, None
@@ -483,11 +537,11 @@ class MultiTaskHead(nn.Module):
 
 class MacroDGRCL(nn.Module):
     """
-    Macro-Aware Dynamic Graph Relation Contrastive Learning Model v1.3.
+    Macro-Aware Dynamic Graph Relation Contrastive Learning Model v1.4.
     
     Multi-Task Learning Architecture:
         1. TemporalEncoder: LSTM projects time-series → embeddings
-        2. DynamicGraphLearner: Computes dynamic Stock→Stock adjacency
+        2. DynamicGraphLearner: Computes dynamic Stock→Stock adjacency (Sector-Constrained)
         3. MacroPropagation: Custom message passing with dual aggregation
         4. MultiTaskHead: Direction (binary) + Magnitude (regression)
     
@@ -568,6 +622,7 @@ class MacroDGRCL(nn.Module):
         stock_features: torch.Tensor,  # [N_s, T, d_s]
         macro_features: torch.Tensor,  # [N_m, T, d_m]
         macro_stock_edges: Optional[torch.Tensor] = None,  # [2, E_ms]
+        sector_mask: Optional[torch.Tensor] = None # [N_s, N_s] boolean mask
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through GNN backbone and Multi-Task head.
@@ -576,6 +631,7 @@ class MacroDGRCL(nn.Module):
             stock_features: [N_s, T, d_s] stock time-series
             macro_features: [N_m, T, d_m] macro time-series
             macro_stock_edges: [2, E_ms] macro→stock edge index
+            sector_mask: [N_s, N_s] boolean mask for sector constraints
             
         Returns:
             direction_logits: [N_s, 1] unbounded logits for P(return > median)
@@ -590,8 +646,11 @@ class MacroDGRCL(nn.Module):
         macro_h = self.embedding_norm(macro_h)
         
         # 2. Dynamic Graph Learning (Stock→Stock)
+        # Pass sector_mask ensuring stocks only attend to peers
         stock_stock_edges, edge_weights = self.graph_learner(
-            stock_h, return_weights=True
+            stock_h, 
+            sector_mask=sector_mask,
+            return_weights=True
         )
         
         # 3. Build Macro→Stock edges if not provided
