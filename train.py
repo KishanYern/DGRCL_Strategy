@@ -5,7 +5,8 @@ Implements:
 - Multi-Task Loss: BCEWithLogitsLoss (direction) + λ·MSELoss (magnitude)
 - Dynamic target engineering from raw returns
 - EarlyStopping on combined validation loss
-- Separate metrics: Direction Accuracy, Magnitude MAE
+- Walk-forward cross-validation
+- Mixed Precision Training (FP16) for GPU memory efficiency
 """
 
 import torch
@@ -17,6 +18,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import json
+import gc
 
 from macro_dgrcl import MacroDGRCL
 
@@ -90,10 +92,6 @@ class EarlyStopping:
 # TRAINING STEP
 # =============================================================================
 
-# =============================================================================
-# TRAINING STEP
-# =============================================================================
-
 def train_step(
     model: MacroDGRCL,
     stock_features: torch.Tensor,  # [N_s, T, d_s]
@@ -106,31 +104,30 @@ def train_step(
     macro_stock_edges: Optional[torch.Tensor] = None,
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None,
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1.0,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None
 ) -> Dict[str, float]:
     """
     Single training step with Multi-Task Learning.
     
     Target Engineering:
         dir_target = (returns > Sector_Median(returns)).float()   → binary {0, 1}
-        mag_target = |returns|                                    → positive continuous
-    
-    Loss:
-        L_total = L_BCE(dir_logits, dir_target) + λ · L_MSE(mag_preds, mag_target)
+        mag_target = |returns|                                     → ℝ≥0
     
     Args:
         model: MacroDGRCL model
-        stock_features: [N_s, T, d_s] stock time-series
-        macro_features: [N_m, T, d_m] macro time-series
-        returns: [N_s] future returns for target generation
+        stock_features: [N_s, T, d_s] time-series
+        macro_features: [N_m, T, d_m] time-series
+        returns: [N_s] future returns (labels)
         optimizer: Optimizer
         bce_loss_fn: BCEWithLogitsLoss for direction
         mse_loss_fn: MSELoss for magnitude
         mag_weight: λ weight for magnitude loss
-        macro_stock_edges: Optional fixed macro→stock edges
-        sector_mask: [N_s, N_s] boolean mask for attention
-        sector_ids: [N_s] integer sector IDs for target generation
+        macro_stock_edges: Optional fixed edges
+        sector_mask: [N_s, N_s] boolean mask
+        sector_ids: [N_s] sector IDs for sector-neutral targets
         max_grad_norm: Gradient clipping threshold
+        scaler: Optional GradScaler for mixed precision training
         
     Returns:
         Dict with loss metrics and task-specific metrics
@@ -170,34 +167,39 @@ def train_step(
         dir_target = (ranks >= N_s / 2).float()  # [N_s]
     
     # Magnitude: absolute return
-    mag_target = torch.abs(returns)  # [N_s]
+    mag_target = torch.abs(returns)
     
-    # --- Forward pass ---
-    dir_logits, mag_preds = model(
-        stock_features=stock_features,
-        macro_features=macro_features,
-        macro_stock_edges=macro_stock_edges,
-        sector_mask=sector_mask
-    )
+    # --------------- Forward Pass ---------------
+    # Use automatic mixed precision (AMP) if scaler is provided
+    use_amp = scaler is not None
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        dir_logits, mag_preds = model(
+            stock_features=stock_features,
+            macro_features=macro_features,
+            macro_stock_edges=macro_stock_edges,
+            sector_mask=sector_mask
+        )
+        
+        # --------------- Loss Computation ---------------
+        loss_dir = bce_loss_fn(dir_logits.squeeze(-1), dir_target)
+        loss_mag = mse_loss_fn(mag_preds.squeeze(-1), mag_target)
+        loss_total = loss_dir + mag_weight * loss_mag
     
-    # --- Loss computation ---
-    # Direction: BCEWithLogitsLoss (numerically stable)
-    loss_dir = bce_loss_fn(dir_logits.squeeze(-1), dir_target)
+    # --------------- Backward Pass ---------------
+    optimizer.zero_grad()
     
-    # Magnitude: MSELoss
-    loss_mag = mse_loss_fn(mag_preds.squeeze(-1), mag_target)
-    
-    # Combined loss
-    loss_total = loss_dir + mag_weight * loss_mag
-    
-    # --- Backward pass ---
-    loss_total.backward()
-    
-    # Gradient clipping
-    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    
-    # Optimizer step
-    optimizer.step()
+    if use_amp:
+        # Mixed precision: use scaler for backward pass
+        scaler.scale(loss_total).backward()
+        scaler.unscale_(optimizer)  # Unscale before clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        # Full precision: standard backward pass
+        loss_total.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
     
     # --- Metrics ---
     with torch.no_grad():
@@ -228,7 +230,8 @@ def train_epoch(
     mag_weight: float = 0.1,
     max_grad_norm: float = 1.0,
     sector_mask: Optional[torch.Tensor] = None,
-    sector_ids: Optional[torch.Tensor] = None
+    sector_ids: Optional[torch.Tensor] = None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None
 ) -> Dict[str, float]:
     """
     Train for one epoch over sequential snapshots.
@@ -244,6 +247,7 @@ def train_epoch(
         max_grad_norm: Gradient clipping threshold
         sector_mask: [N_s, N_s] boolean mask
         sector_ids: [N_s] sector IDs
+        scaler: Optional GradScaler for mixed precision training
         
     Returns:
         Dict with epoch-level metrics (averaged across batches)
@@ -277,7 +281,8 @@ def train_epoch(
             mag_weight=mag_weight,
             max_grad_norm=max_grad_norm,
             sector_mask=sector_mask,
-            sector_ids=sector_ids
+            sector_ids=sector_ids,
+            scaler=scaler
         )
         
         for key in epoch_metrics:
@@ -356,12 +361,14 @@ def evaluate(
             
         mag_target = torch.abs(returns)
         
-        # Forward pass
-        dir_logits, mag_preds = model(
-            stock_features=stock_feat,
-            macro_features=macro_feat,
-            sector_mask=sector_mask
-        )
+        # Forward pass with mixed precision (consistent with training)
+        # Note: no scaler needed in eval since we don't do backward pass
+        with torch.cuda.amp.autocast(enabled=stock_feat.is_cuda):
+            dir_logits, mag_preds = model(
+                stock_features=stock_feat,
+                macro_features=macro_feat,
+                sector_mask=sector_mask
+            )
         
         # Losses
         loss_dir = bce_loss_fn(dir_logits.squeeze(-1), dir_target)
@@ -497,7 +504,8 @@ def save_attention_heatmap(
     fold_idx: int,
     output_dir: str,
     tickers: Optional[List[str]] = None,
-    max_display: int = 30
+    max_display: int = 30,
+    sector_mask: Optional[torch.Tensor] = None
 ):
     """
     Visualize the DynamicGraphLearner attention weights as a heatmap.
@@ -513,17 +521,23 @@ def save_attention_heatmap(
         output_dir: Directory to save the heatmap
         tickers: Optional list of ticker names for axis labels
         max_display: Maximum number of stocks to show (for readability)
+        sector_mask: [N_s, N_s] boolean sector mask (same as used in training)
     """
     model.eval()
     os.makedirs(output_dir, exist_ok=True)
     
     with torch.no_grad():
-        # Get temporal embeddings
+        # Match model's actual forward path: encode → normalize → graph_learner
         stock_h = model.stock_encoder(stock_features)  # [N_s, H]
+        stock_h = model.embedding_norm(stock_h)         # LayerNorm (was missing!)
         
-        # Get attention weights from graph learner
+        # Ensure sector_mask is on the same device as the model
+        if sector_mask is not None:
+            sector_mask = sector_mask.to(stock_features.device)
+        
+        # Pass sector_mask so cross-sector pairs are masked (was missing!)
         edge_index, edge_weights = model.graph_learner(
-            stock_h, return_weights=True
+            stock_h, sector_mask=sector_mask, return_weights=True
         )
     
     N_s = stock_features.size(0)
@@ -534,8 +548,17 @@ def save_attention_heatmap(
     src, dst = edge_index
     attn_matrix[dst, src] = edge_weights  # dst attends to src
     
+    # Apply row-wise softmax over non-zero entries so heatmap shows
+    # meaningful probability distributions instead of raw scores.
+    # Mask zero entries (no edge) with -inf before softmax.
+    mask = (attn_matrix == 0)
+    attn_matrix_softmax = attn_matrix.masked_fill(mask, float('-inf'))
+    attn_matrix_softmax = torch.softmax(attn_matrix_softmax, dim=1)
+    # Replace any NaN rows (fully masked) with 0
+    attn_matrix_softmax = torch.nan_to_num(attn_matrix_softmax, nan=0.0)
+    
     # Crop to displayable size
-    attn_np = attn_matrix[:n_display, :n_display].cpu().numpy()
+    attn_np = attn_matrix_softmax[:n_display, :n_display].cpu().numpy()
     
     fig, ax = plt.subplots(figsize=(12, 10))
     im = ax.imshow(attn_np, cmap='YlOrRd', aspect='auto')
@@ -697,7 +720,8 @@ def main(
     start_fold: int = 1,
     end_fold: Optional[int] = None,
     mag_weight: float = 0.1,
-    force_cpu: bool = False
+    force_cpu: bool = False,
+    use_amp: bool = True
 ):
     """
     Training loop with Multi-Task Learning.
@@ -707,8 +731,9 @@ def main(
                        If False, use synthetic random data
         start_fold: First fold to run (1-based index)
         end_fold: Last fold to run (1-based index, inclusive). If None, run all.
-        mag_weight: λ weight for magnitude loss (default 1.0)
+        mag_weight: λ weight for magnitude loss (default 0.1)
         force_cpu: If True, force CPU mode (avoids GPU memory issues)
+        use_amp: If True, enable mixed precision (FP16) training for memory efficiency
     """
     # Hyperparameters
     STOCK_DIM = 8  # ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
@@ -736,6 +761,14 @@ def main(
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"Magnitude loss weight (λ): {mag_weight}")
+    
+    # Initialize GradScaler for mixed precision training
+    scaler = None
+    if use_amp and device.type == 'cuda':
+        scaler = torch.cuda.amp.GradScaler()
+        print("Mixed Precision Training (FP16): ENABLED")
+    else:
+        print("Mixed Precision Training (FP16): DISABLED")
     
     if use_real_data:
         from data_loader import load_and_prepare_backtest
@@ -833,9 +866,11 @@ def main(
             print(f"\nFold {current_fold_num} already completed (checkpoint), skipping...")
             continue
             
-        # Free GPU memory from previous fold
+        # Enhanced GPU memory clearing from previous fold
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # Wait for all kernels to finish
+            torch.cuda.empty_cache()  # Release cached memory
+        gc.collect()  # Python garbage collection
         
         print(f"\n{'='*60}")
         print(f"FOLD {fold_idx + 1}/{len(folds)}")
@@ -875,7 +910,7 @@ def main(
         print("\nTraining...")
         epoch_losses = []
         for epoch in range(NUM_EPOCHS):
-            metrics = train_epoch(
+            epoch_metrics = train_epoch(
                 model=model,
                 data_loader=train_data,
                 optimizer=optimizer,
@@ -883,19 +918,21 @@ def main(
                 mse_loss_fn=mse_loss_fn,
                 device=device,
                 mag_weight=mag_weight,
+                max_grad_norm=1.0,
                 sector_mask=sector_mask,
-                sector_ids=sector_ids
+                sector_ids=sector_ids,
+                scaler=scaler
             )
-            epoch_losses.append(metrics['loss'])
+            epoch_losses.append(epoch_metrics['loss'])
             
             scheduler.step()
             
             if (epoch + 1) % 20 == 0:
                 print(f"  Epoch {epoch+1}/{NUM_EPOCHS} | "
-                      f"Loss: {metrics['loss']:.4f} "
-                      f"(Dir: {metrics['loss_dir']:.4f}, Mag: {metrics['loss_mag']:.4f}) | "
-                      f"Dir Acc: {metrics['dir_accuracy']*100:.1f}% | "
-                      f"Mag MAE: {metrics['mag_mae']:.4f} | "
+                      f"Loss: {epoch_metrics['loss']:.4f} "
+                      f"(Dir: {epoch_metrics['loss_dir']:.4f}, Mag: {epoch_metrics['loss_mag']:.4f}) | "
+                      f"Dir Acc: {epoch_metrics['dir_accuracy']*100:.1f}% | "
+                      f"Mag MAE: {epoch_metrics['mag_mae']:.4f} | "
                       f"LR: {scheduler.get_last_lr()[0]:.6f}")
             
             # Early stopping check on validation data
@@ -944,7 +981,7 @@ def main(
             
             all_fold_results.append({
                 'fold': fold_idx + 1,
-                'train_loss': metrics['loss'],
+                'train_loss': epoch_metrics['loss'],
                 'val_loss': val_metrics['loss'],
                 'dir_accuracy': val_metrics['dir_accuracy'],
                 'mag_mae': val_metrics['mag_mae'],
@@ -954,10 +991,10 @@ def main(
         else:
             all_fold_results.append({
                 'fold': fold_idx + 1,
-                'train_loss': metrics['loss'],
+                'train_loss': epoch_metrics['loss'],
                 'val_loss': None,
-                'dir_accuracy': metrics['dir_accuracy'],
-                'mag_mae': metrics['mag_mae'],
+                'dir_accuracy': epoch_metrics['dir_accuracy'],
+                'mag_mae': epoch_metrics['mag_mae'],
                 'train_start_idx': fold_idx * FOLD_STEP,
                 'val_end_idx': fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
             })
@@ -1017,7 +1054,8 @@ def main(
             macro_features=test_macro,
             fold_idx=len(folds) - 1,
             output_dir=VIS_DIR,
-            tickers=tickers if use_real_data else None
+            tickers=tickers if use_real_data else None,
+            sector_mask=sector_mask
         )
     else:
         print("\nNo model trained (all folds skipped). Skipping inference.")

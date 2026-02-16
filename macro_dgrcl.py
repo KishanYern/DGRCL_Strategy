@@ -216,7 +216,10 @@ class DynamicGraphLearner(nn.Module):
     
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.W.weight)
-        nn.init.normal_(self.a, std=0.01)
+        # Use Xavier-scale std so attention scores have meaningful variance.
+        # std=0.01 on a 2H-dim vector produces near-zero dot products,
+        # collapsing all attention scores to ~0 (uniform attention).
+        nn.init.normal_(self.a, std=1.0 / (2 * self.W.in_features) ** 0.5)
     
     def forward(
         self,
@@ -256,17 +259,18 @@ class DynamicGraphLearner(nn.Module):
             if sector_mask.shape != attention.shape:
                raise ValueError(f"Sector mask shape {sector_mask.shape} mismatch with attention {attention.shape}")
             
-            # Mask out cross-sector pairs with -inf
-            # kept: mask is True. removed: mask is False.
-            attention = attention.masked_fill(~sector_mask, -1e9)
+            # Mask out cross-sector pairs with large negative value.
+            # Use dtype-aware min to avoid FP16 overflow (-1e9 > Half max ~65504).
+            mask_value = torch.finfo(attention.dtype).min / 2
+            attention = attention.masked_fill(~sector_mask, mask_value)
 
         # Top-k selection per row (each node keeps top-k neighbors)
         k = min(self.top_k, N - 1)
         topk_values, topk_indices = torch.topk(attention, k=k, dim=1)  # [N, k]
         
-        # Filter out masked edges (values close to -1e9)
+        # Filter out masked edges (values near dtype min)
         # This handles the case where k > sector_size
-        valid_mask = topk_values > -1e8  # [N, k]
+        valid_mask = topk_values > (torch.finfo(topk_values.dtype).min / 4)  # [N, k]
         
         # Build sparse edge_index
         # CRITICAL: In PyG MessagePassing, info flows src → dst
@@ -431,7 +435,8 @@ class MacroPropagation(MessagePassing):
         
         # Aggregate
         out = h_j * alpha.unsqueeze(-1)  # [E, H, D]
-        out = torch.zeros_like(h).scatter_add_(0, dst.view(-1, 1, 1).expand_as(out), out)
+        # Use matching dtype for scatter_add_ (autocast may mix FP16/FP32)
+        out = torch.zeros(h.shape, dtype=out.dtype, device=h.device).scatter_add_(0, dst.view(-1, 1, 1).expand_as(out), out)
         
         return out
     
@@ -459,7 +464,8 @@ class MacroPropagation(MessagePassing):
         
         # Aggregate macro messages to stock nodes
         out = h_macro * beta.unsqueeze(-1)  # [E, H, D]
-        out = torch.zeros_like(stock_h).scatter_add_(
+        # Use matching dtype for scatter_add_ (autocast may mix FP16/FP32)
+        out = torch.zeros(stock_h.shape, dtype=out.dtype, device=stock_h.device).scatter_add_(
             0, dst.view(-1, 1, 1).expand_as(out), out
         )
         
