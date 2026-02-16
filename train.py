@@ -1,9 +1,9 @@
 """
-Training Loop for Macro-Aware DGRCL v1.3 (Multi-Task Learning)
+Training Loop for Macro-Aware DGRCL v1.5 (Pairwise Ranking)
 
 Implements:
-- Multi-Task Loss: BCEWithLogitsLoss (direction) + λ·MSELoss (magnitude)
-- Dynamic target engineering from raw returns
+- Pairwise Margin Ranking Loss: Sector-aware margin ranking (direction)
+- SmoothL1Loss on log-scaled |returns| (magnitude)
 - EarlyStopping on combined validation loss
 - Walk-forward cross-validation
 - Mixed Precision Training (FP16) for GPU memory efficiency
@@ -92,14 +92,89 @@ class EarlyStopping:
 # TRAINING STEP
 # =============================================================================
 
+# Ranking loss hyperparameters
+RANKING_MARGIN = 0.5        # Logit separation required between winner/loser
+SIGNIFICANCE_THRESHOLD = 0.01  # 1% return divergence to qualify as valid pair
+
+
+def compute_pairwise_ranking_loss(
+    scores: torch.Tensor,        # [N_s] model output logits
+    returns: torch.Tensor,       # [N_s] actual returns
+    sector_mask: Optional[torch.Tensor] = None,  # [N_s, N_s] bool
+    margin: float = RANKING_MARGIN,
+    threshold: float = SIGNIFICANCE_THRESHOLD
+) -> Tuple[torch.Tensor, float]:
+    """
+    Sector-Aware Pairwise Margin Ranking Loss.
+    
+    For each valid pair (i, j) within the same sector where
+    returns[i] - returns[j] > threshold, enforce:
+        score[i] - score[j] > margin
+    
+    Loss = mean(relu(margin - (score_i - score_j))) over valid pairs.
+    
+    Args:
+        scores: [N_s] unbounded direction logits from model
+        returns: [N_s] actual future returns
+        sector_mask: [N_s, N_s] True where stocks share a sector
+        margin: Required logit separation between winner and loser
+        threshold: Minimum return difference to form a valid pair
+        
+    Returns:
+        Tuple of (ranking_loss, pairwise_rank_accuracy)
+    """
+    # 1. Pairwise return differences: ret_diff[i, j] = returns[i] - returns[j]
+    ret_diff = returns.unsqueeze(1) - returns.unsqueeze(0)  # [N_s, N_s]
+    
+    # 2. Pairwise score differences: score_diff[i, j] = scores[i] - scores[j]
+    score_diff = scores.unsqueeze(1) - scores.unsqueeze(0)  # [N_s, N_s]
+    
+    # 3. Valid pairs mask: same sector AND significant return divergence
+    # Only consider directed pairs where i outperformed j by > threshold
+    valid_pairs = (ret_diff > threshold)
+    if sector_mask is not None:
+        valid_pairs = valid_pairs & sector_mask
+    
+    # 4. Compute margin ranking loss: max(0, margin - score_diff)
+    ranking_loss_matrix = torch.relu(margin - score_diff)
+    
+    if valid_pairs.sum() > 0:
+        loss = ranking_loss_matrix[valid_pairs].mean()
+        # Pairwise ranking accuracy: % of valid pairs where score_i > score_j
+        rank_acc = (score_diff[valid_pairs] > 0).float().mean().item()
+    else:
+        loss = torch.tensor(0.0, device=scores.device, requires_grad=True)
+        rank_acc = 0.0
+    
+    return loss, rank_acc
+
+
+def compute_log_scaled_mag_target(returns: torch.Tensor) -> torch.Tensor:
+    """
+    Log-scale magnitude targets: log(1 + |returns| / σ).
+    
+    Normalizes raw absolute returns (~0.001–0.02 range) into a
+    well-behaved ~[0, 3] range so SmoothL1Loss can produce meaningful
+    gradients instead of behaving as pure MSE.
+    
+    Args:
+        returns: [N_s] raw future returns
+        
+    Returns:
+        [N_s] log-scaled magnitude targets
+    """
+    abs_ret = torch.abs(returns)
+    sigma = abs_ret.std().clamp(min=1e-6)
+    return torch.log1p(abs_ret / sigma)
+
+
 def train_step(
     model: MacroDGRCL,
     stock_features: torch.Tensor,  # [N_s, T, d_s]
     macro_features: torch.Tensor,  # [N_m, T, d_m]
     returns: torch.Tensor,  # [N_s] future returns (labels)
     optimizer: torch.optim.Optimizer,
-    bce_loss_fn: nn.BCEWithLogitsLoss,
-    mse_loss_fn: nn.MSELoss,
+    mse_loss_fn: nn.Module,
     mag_weight: float = 0.1,
     macro_stock_edges: Optional[torch.Tensor] = None,
     sector_mask: Optional[torch.Tensor] = None,
@@ -108,11 +183,13 @@ def train_step(
     scaler: Optional[torch.cuda.amp.GradScaler] = None
 ) -> Dict[str, float]:
     """
-    Single training step with Multi-Task Learning.
+    Single training step with Pairwise Ranking + Magnitude regression.
     
-    Target Engineering:
-        dir_target = (returns > Sector_Median(returns)).float()   → binary {0, 1}
-        mag_target = |returns|                                     → ℝ≥0
+    Direction Loss:  Sector-Aware Pairwise Margin Ranking
+        For pairs (i, j) in same sector where ret_i - ret_j > 1%,
+        enforce: score_i - score_j > margin (0.5)
+    
+    Magnitude Loss:  SmoothL1Loss on log(1 + |returns| / σ)
     
     Args:
         model: MacroDGRCL model
@@ -120,12 +197,11 @@ def train_step(
         macro_features: [N_m, T, d_m] time-series
         returns: [N_s] future returns (labels)
         optimizer: Optimizer
-        bce_loss_fn: BCEWithLogitsLoss for direction
-        mse_loss_fn: MSELoss for magnitude
+        mse_loss_fn: SmoothL1Loss for magnitude
         mag_weight: λ weight for magnitude loss
         macro_stock_edges: Optional fixed edges
         sector_mask: [N_s, N_s] boolean mask
-        sector_ids: [N_s] sector IDs for sector-neutral targets
+        sector_ids: [N_s] sector IDs (unused, kept for API compat)
         max_grad_norm: Gradient clipping threshold
         scaler: Optional GradScaler for mixed precision training
         
@@ -135,42 +211,7 @@ def train_step(
     model.train()
     optimizer.zero_grad()
     
-    # --- Target Engineering ---
-    # Direction: Return > Sector Median ? 1 : 0
-    # This neutralizes sector beta and forces relative value learning.
-    
-    if sector_ids is not None:
-        # Compute median return per sector
-        unique_sectors = torch.unique(sector_ids)
-        dir_target = torch.zeros_like(returns)
-        
-        for s_id in unique_sectors:
-            mask = (sector_ids == s_id)
-            sector_returns = returns[mask]
-            
-            if len(sector_returns) > 1:
-                # Calculate median for this sector
-                median_val = sector_returns.median()
-                # 1 if > median, 0 otherwise
-                dir_target[mask] = (sector_returns > median_val).float()
-            else:
-                # If only 1 stock in sector, can't compute relative value
-                # Fallback to global 0 (hold) or ignore? 
-                # Let's set to 0.5 (uncertain) -> binary 0 or 1 arbitrarily?
-                # Actually, standard practice is to exclude or set to 0.
-                dir_target[mask] = 0.0 # Default to SELL/HOLD
-                
-    else:
-        # Fallback to Global Median if no sectors provided (Backward Compatibility)
-        N_s = returns.size(0)
-        ranks = returns.argsort().argsort().float()
-        dir_target = (ranks >= N_s / 2).float()  # [N_s]
-    
-    # Magnitude: absolute return
-    mag_target = torch.abs(returns)
-    
     # --------------- Forward Pass ---------------
-    # Use automatic mixed precision (AMP) if scaler is provided
     use_amp = scaler is not None
     with torch.cuda.amp.autocast(enabled=use_amp):
         dir_logits, mag_preds = model(
@@ -180,41 +221,44 @@ def train_step(
             sector_mask=sector_mask
         )
         
-        # --------------- Loss Computation ---------------
-        loss_dir = bce_loss_fn(dir_logits.squeeze(-1), dir_target)
+        scores = dir_logits.squeeze(-1)  # [N_s]
+        
+        # --------------- Direction: Pairwise Margin Ranking Loss ---------------
+        loss_dir, rank_accuracy = compute_pairwise_ranking_loss(
+            scores=scores,
+            returns=returns,
+            sector_mask=sector_mask
+        )
+        
+        # --------------- Magnitude: SmoothL1 on log-scaled targets ---------------
+        mag_target = compute_log_scaled_mag_target(returns)
         loss_mag = mse_loss_fn(mag_preds.squeeze(-1), mag_target)
+        
         loss_total = loss_dir + mag_weight * loss_mag
     
     # --------------- Backward Pass ---------------
     optimizer.zero_grad()
     
     if use_amp:
-        # Mixed precision: use scaler for backward pass
         scaler.scale(loss_total).backward()
-        scaler.unscale_(optimizer)  # Unscale before clipping
+        scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
     else:
-        # Full precision: standard backward pass
         loss_total.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
     
     # --- Metrics ---
     with torch.no_grad():
-        # Direction accuracy
-        dir_preds = (dir_logits.squeeze(-1) > 0.0).float()
-        dir_accuracy = (dir_preds == dir_target).float().mean().item()
-        
-        # Magnitude MAE
         mag_mae = torch.abs(mag_preds.squeeze(-1) - mag_target).mean().item()
     
     return {
         'loss': loss_total.item(),
         'loss_dir': loss_dir.item(),
         'loss_mag': loss_mag.item(),
-        'dir_accuracy': dir_accuracy,
+        'rank_accuracy': rank_accuracy,
         'mag_mae': mag_mae,
         'grad_norm': grad_norm.item()
     }
@@ -224,8 +268,7 @@ def train_epoch(
     model: MacroDGRCL,
     data_loader: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     optimizer: torch.optim.Optimizer,
-    bce_loss_fn: nn.BCEWithLogitsLoss,
-    mse_loss_fn: nn.MSELoss,
+    mse_loss_fn: nn.Module,
     device: torch.device,
     mag_weight: float = 0.1,
     max_grad_norm: float = 1.0,
@@ -240,8 +283,7 @@ def train_epoch(
         model: MacroDGRCL model
         data_loader: List of (stock_features, macro_features, returns) tuples
         optimizer: Optimizer
-        bce_loss_fn: BCEWithLogitsLoss
-        mse_loss_fn: MSELoss
+        mse_loss_fn: SmoothL1Loss for magnitude
         device: Torch device
         mag_weight: λ for magnitude loss
         max_grad_norm: Gradient clipping threshold
@@ -255,7 +297,7 @@ def train_epoch(
     model.train()
     epoch_metrics = {
         'loss': 0.0, 'loss_dir': 0.0, 'loss_mag': 0.0,
-        'dir_accuracy': 0.0, 'mag_mae': 0.0
+        'rank_accuracy': 0.0, 'mag_mae': 0.0
     }
     num_batches = 0
     
@@ -276,7 +318,6 @@ def train_epoch(
             macro_features=macro_feat,
             returns=returns,
             optimizer=optimizer,
-            bce_loss_fn=bce_loss_fn,
             mse_loss_fn=mse_loss_fn,
             mag_weight=mag_weight,
             max_grad_norm=max_grad_norm,
@@ -301,25 +342,23 @@ def train_epoch(
 def evaluate(
     model: MacroDGRCL,
     data_loader: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    bce_loss_fn: nn.BCEWithLogitsLoss,
-    mse_loss_fn: nn.MSELoss,
+    mse_loss_fn: nn.Module,
     device: torch.device,
     mag_weight: float = 0.1,
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None
 ) -> Dict[str, float]:
     """
-    Evaluate model on validation data with multi-task metrics.
+    Evaluate model on validation data with pairwise ranking + magnitude metrics.
     
     Args:
         model: MacroDGRCL model
         data_loader: Validation data
-        bce_loss_fn: BCEWithLogitsLoss
-        mse_loss_fn: MSELoss
+        mse_loss_fn: SmoothL1Loss for magnitude
         device: Torch device
         mag_weight: λ for magnitude loss
         sector_mask: [N_s, N_s] boolean mask
-        sector_ids: [N_s] sector IDs
+        sector_ids: [N_s] sector IDs (unused, kept for API compat)
         
     Returns:
         Dict with evaluation metrics
@@ -327,42 +366,19 @@ def evaluate(
     model.eval()
     eval_metrics = {
         'loss': 0.0, 'loss_dir': 0.0, 'loss_mag': 0.0,
-        'dir_accuracy': 0.0, 'mag_mae': 0.0
+        'rank_accuracy': 0.0, 'mag_mae': 0.0
     }
     num_batches = 0
     
     if sector_mask is not None:
         sector_mask = sector_mask.to(device)
-    if sector_ids is not None:
-        sector_ids = sector_ids.to(device)
     
     for stock_feat, macro_feat, returns in data_loader:
         stock_feat = stock_feat.to(device)
         macro_feat = macro_feat.to(device)
         returns = returns.to(device)
         
-        # Target engineering (Sector-Neutral)
-        if sector_ids is not None:
-            unique_sectors = torch.unique(sector_ids)
-            dir_target = torch.zeros_like(returns)
-            for s_id in unique_sectors:
-                mask = (sector_ids == s_id)
-                sector_returns = returns[mask]
-                if len(sector_returns) > 1:
-                    median_val = sector_returns.median()
-                    dir_target[mask] = (sector_returns > median_val).float()
-                else:
-                    dir_target[mask] = 0.0
-        else:
-            # Fallback
-            N_s = returns.size(0)
-            ranks = returns.argsort().argsort().float()
-            dir_target = (ranks >= N_s / 2).float()
-            
-        mag_target = torch.abs(returns)
-        
         # Forward pass with mixed precision (consistent with training)
-        # Note: no scaler needed in eval since we don't do backward pass
         with torch.cuda.amp.autocast(enabled=stock_feat.is_cuda):
             dir_logits, mag_preds = model(
                 stock_features=stock_feat,
@@ -370,20 +386,26 @@ def evaluate(
                 sector_mask=sector_mask
             )
         
-        # Losses
-        loss_dir = bce_loss_fn(dir_logits.squeeze(-1), dir_target)
+        scores = dir_logits.squeeze(-1)
+        
+        # Direction: Pairwise Margin Ranking Loss
+        loss_dir, rank_accuracy = compute_pairwise_ranking_loss(
+            scores=scores,
+            returns=returns,
+            sector_mask=sector_mask
+        )
+        
+        # Magnitude: SmoothL1 on log-scaled targets
+        mag_target = compute_log_scaled_mag_target(returns)
         loss_mag = mse_loss_fn(mag_preds.squeeze(-1), mag_target)
         loss_total = loss_dir + mag_weight * loss_mag
         
-        # Metrics
-        dir_preds = (dir_logits.squeeze(-1) > 0.0).float()
-        dir_accuracy = (dir_preds == dir_target).float().mean().item()
         mag_mae = torch.abs(mag_preds.squeeze(-1) - mag_target).mean().item()
         
         eval_metrics['loss'] += loss_total.item()
         eval_metrics['loss_dir'] += loss_dir.item()
         eval_metrics['loss_mag'] += loss_mag.item()
-        eval_metrics['dir_accuracy'] += dir_accuracy
+        eval_metrics['rank_accuracy'] += rank_accuracy
         eval_metrics['mag_mae'] += mag_mae
         num_batches += 1
     
@@ -442,7 +464,11 @@ def mc_dropout_inference(
     Monte Carlo Dropout inference for uncertainty estimation.
     
     Runs n_samples stochastic forward passes with dropout enabled,
-    then computes mean prediction and confidence (inverse of std).
+    then computes mean prediction and confidence from raw score variance.
+    
+    For pairwise ranking models, confidence is derived from the stability
+    of the raw direction scores (logits) across MC passes — NOT from
+    sigmoid probabilities, which compress near 0.5 and hide uncertainty.
     
     Args:
         model: MacroDGRCL model
@@ -453,15 +479,17 @@ def mc_dropout_inference(
         
     Returns:
         Dict with keys:
-            dir_prob_mean: [N_s] mean P(up) across samples
-            dir_prob_std:  [N_s] std of P(up) — uncertainty
-            mag_mean:      [N_s] mean magnitude prediction
-            mag_std:       [N_s] std of magnitude prediction
-            confidence:    [N_s] 1/(1+std) — higher = more confident
+            dir_score_mean: [N_s] mean raw direction score (logit)
+            dir_score_std:  [N_s] std of raw scores — uncertainty
+            mag_mean:       [N_s] mean magnitude prediction
+            mag_std:        [N_s] std of magnitude prediction
+            confidence:     [N_s] 1/(1+score_std) — higher = more confident
+            rank_stability: scalar — fraction of pairwise rankings that are
+                            consistent across all MC passes (0=chaotic, 1=stable)
     """
     model.train()  # Keep dropout active
     
-    dir_probs_all = []
+    dir_scores_all = []
     mag_preds_all = []
     
     with torch.no_grad():
@@ -471,29 +499,47 @@ def mc_dropout_inference(
                 macro_features=macro_features,
                 macro_stock_edges=macro_stock_edges
             )
-            dir_probs_all.append(torch.sigmoid(dir_logits.squeeze(-1)))  # [N_s]
-            mag_preds_all.append(mag_preds.squeeze(-1))  # [N_s]
+            dir_scores_all.append(dir_logits.squeeze(-1))  # [N_s] raw scores
+            mag_preds_all.append(mag_preds.squeeze(-1))    # [N_s]
     
     # Stack: [n_samples, N_s]
-    dir_probs_stack = torch.stack(dir_probs_all, dim=0)
+    dir_scores_stack = torch.stack(dir_scores_all, dim=0)
     mag_preds_stack = torch.stack(mag_preds_all, dim=0)
     
-    dir_prob_mean = dir_probs_stack.mean(dim=0)
-    dir_prob_std = dir_probs_stack.std(dim=0)
+    dir_score_mean = dir_scores_stack.mean(dim=0)
+    dir_score_std = dir_scores_stack.std(dim=0)
     mag_mean = mag_preds_stack.mean(dim=0)
     mag_std = mag_preds_stack.std(dim=0)
     
-    # Confidence: inverse of combined uncertainty
-    confidence = 1.0 / (1.0 + dir_prob_std)
+    # Confidence: inverse of raw score uncertainty
+    # score_std captures how much the model's ranking changes under dropout
+    confidence = 1.0 / (1.0 + dir_score_std)
+    
+    # Rank stability: how consistent are the stock rankings across MC passes?
+    # Uses Spearman rank correlation (vectorized) instead of O(N²) Kendall tau.
+    if n_samples >= 2 and dir_scores_stack.shape[1] >= 2:
+        ref_ranks = dir_scores_stack[0].argsort().argsort().float()  # [N_s]
+        correlations = []
+        for i in range(1, n_samples):
+            sample_ranks = dir_scores_stack[i].argsort().argsort().float()
+            # Spearman correlation via Pearson on ranks
+            corr_matrix = torch.corrcoef(torch.stack([ref_ranks, sample_ranks]))
+            correlations.append(corr_matrix[0, 1].item())
+        rank_stability = sum(correlations) / len(correlations)
+        # Clamp to [0, 1] — negative correlation means chaotic
+        rank_stability = max(0.0, rank_stability)
+    else:
+        rank_stability = 0.0
     
     model.eval()  # Restore eval mode
     
     return {
-        'dir_prob_mean': dir_prob_mean,
-        'dir_prob_std': dir_prob_std,
+        'dir_score_mean': dir_score_mean,
+        'dir_score_std': dir_score_std,
         'mag_mean': mag_mean,
         'mag_std': mag_std,
         'confidence': confidence,
+        'rank_stability': torch.tensor(rank_stability),
     }
 
 
@@ -607,7 +653,7 @@ def save_backtest_summary(all_fold_results: List[Dict], output_dir: str, dates=N
     folds = [r['fold'] for r in all_fold_results]
     train_losses = [r['train_loss'] for r in all_fold_results]
     val_losses = [r['val_loss'] if r['val_loss'] is not None else 0 for r in all_fold_results]
-    dir_accs = [r.get('dir_accuracy', 0) for r in all_fold_results]
+    dir_accs = [r.get('rank_accuracy', 0) for r in all_fold_results]
     mag_maes = [r.get('mag_mae', 0) for r in all_fold_results]
     
     # Create figure with market regime context
@@ -691,8 +737,8 @@ def save_backtest_summary(all_fold_results: List[Dict], output_dir: str, dates=N
                     label=f'Mean: {mean_acc:.1f}%')
         ax3.legend()
     ax3.set_xlabel('Fold')
-    ax3.set_ylabel('Direction Accuracy (%)')
-    ax3.set_title('Direction Head Accuracy')
+    ax3.set_ylabel('Rank Accuracy (%)')
+    ax3.set_title('Pairwise Rank Accuracy')
     ax3.grid(True, alpha=0.3)
     
     # --- Bottom Row: Magnitude MAE ---
@@ -742,8 +788,8 @@ def main(
     WINDOW_SIZE = 60
     NUM_EPOCHS = 100
     LR = 1e-4
-    WEIGHT_DECAY = 1e-1
-    PATIENCE = 25  # Early stopping patience
+    WEIGHT_DECAY = 1e-3
+    PATIENCE = 40  # Early stopping patience — allow more exploration
     MAX_STOCKS = 150  # Stock universe size
     
     # Walk-forward parameters (only used with real data)
@@ -837,8 +883,7 @@ def main(
         sector_mask = None
         sector_ids = None
     
-    # Loss functions (shared across folds)
-    bce_loss_fn = nn.BCEWithLogitsLoss()
+    # Loss function (shared across folds)
     mse_loss_fn = nn.SmoothL1Loss()
     
     # Load any previously completed fold results for resume
@@ -903,7 +948,7 @@ def main(
             lr=LR,
             weight_decay=WEIGHT_DECAY
         )
-        scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+        scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
         early_stopping = EarlyStopping(patience=PATIENCE)
         
         # Training loop for this fold
@@ -914,7 +959,6 @@ def main(
                 model=model,
                 data_loader=train_data,
                 optimizer=optimizer,
-                bce_loss_fn=bce_loss_fn,
                 mse_loss_fn=mse_loss_fn,
                 device=device,
                 mag_weight=mag_weight,
@@ -931,7 +975,7 @@ def main(
                 print(f"  Epoch {epoch+1}/{NUM_EPOCHS} | "
                       f"Loss: {epoch_metrics['loss']:.4f} "
                       f"(Dir: {epoch_metrics['loss_dir']:.4f}, Mag: {epoch_metrics['loss_mag']:.4f}) | "
-                      f"Dir Acc: {epoch_metrics['dir_accuracy']*100:.1f}% | "
+                      f"Rank Acc: {epoch_metrics['rank_accuracy']*100:.1f}% | "
                       f"Mag MAE: {epoch_metrics['mag_mae']:.4f} | "
                       f"LR: {scheduler.get_last_lr()[0]:.6f}")
             
@@ -940,7 +984,6 @@ def main(
                 val_metrics = evaluate(
                     model=model,
                     data_loader=val_data,
-                    bce_loss_fn=bce_loss_fn,
                     mse_loss_fn=mse_loss_fn,
                     device=device,
                     mag_weight=mag_weight,
@@ -967,7 +1010,6 @@ def main(
             val_metrics = evaluate(
                 model=model,
                 data_loader=val_data,
-                bce_loss_fn=bce_loss_fn,
                 mse_loss_fn=mse_loss_fn,
                 device=device,
                 mag_weight=mag_weight,
@@ -976,14 +1018,14 @@ def main(
             )
             print(f"  Val Loss: {val_metrics['loss']:.4f} "
                   f"(Dir: {val_metrics['loss_dir']:.4f}, Mag: {val_metrics['loss_mag']:.4f})")
-            print(f"  Dir Accuracy: {val_metrics['dir_accuracy']*100:.1f}%")
+            print(f"  Rank Accuracy: {val_metrics['rank_accuracy']*100:.1f}%")
             print(f"  Mag MAE: {val_metrics['mag_mae']:.4f}")
             
             all_fold_results.append({
                 'fold': fold_idx + 1,
                 'train_loss': epoch_metrics['loss'],
                 'val_loss': val_metrics['loss'],
-                'dir_accuracy': val_metrics['dir_accuracy'],
+                'rank_accuracy': val_metrics['rank_accuracy'],
                 'mag_mae': val_metrics['mag_mae'],
                 'train_start_idx': fold_idx * FOLD_STEP,
                 'val_end_idx': fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
@@ -993,7 +1035,7 @@ def main(
                 'fold': fold_idx + 1,
                 'train_loss': epoch_metrics['loss'],
                 'val_loss': None,
-                'dir_accuracy': epoch_metrics['dir_accuracy'],
+                'rank_accuracy': epoch_metrics['rank_accuracy'],
                 'mag_mae': epoch_metrics['mag_mae'],
                 'train_start_idx': fold_idx * FOLD_STEP,
                 'val_end_idx': fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
@@ -1007,18 +1049,18 @@ def main(
     
     # Summary
     print(f"\n{'='*60}")
-    print("BACKTEST SUMMARY (v1.4 Multi-Task Sector-Aware)")
+    print("BACKTEST SUMMARY (v1.5 Pairwise Ranking)")
     print(f"{'='*60}")
     
     val_losses = [r['val_loss'] for r in all_fold_results if r['val_loss'] is not None]
-    dir_accs = [r['dir_accuracy'] for r in all_fold_results]
+    rank_accs = [r['rank_accuracy'] for r in all_fold_results]
     mag_maes = [r['mag_mae'] for r in all_fold_results]
     
     if val_losses:
         print(f"Average Val Loss: {np.mean(val_losses):.4f} ± {np.std(val_losses):.4f}")
         print(f"Best Fold: {np.argmin(val_losses) + 1} (Loss: {min(val_losses):.4f})")
     
-    print(f"Average Dir Accuracy: {np.mean(dir_accs)*100:.1f}%")
+    print(f"Average Rank Accuracy: {np.mean(rank_accs)*100:.1f}%")
     print(f"Average Mag MAE: {np.mean(mag_maes):.4f}")
     
     # Save backtest summary visualization
@@ -1038,13 +1080,14 @@ def main(
             macro_stock_edges=None  # Can be passed if we had fixed edges
         )
         
-        print(f"  Direction P(up) mean:  {mc_results['dir_prob_mean'].mean().item():.4f}")
-        print(f"  Direction uncertainty:  {mc_results['dir_prob_std'].mean().item():.4f}")
+        print(f"  Direction score mean:  {mc_results['dir_score_mean'].mean().item():.4f}")
+        print(f"  Direction score std:   {mc_results['dir_score_std'].mean().item():.4f}")
         print(f"  Magnitude mean:        {mc_results['mag_mean'].mean().item():.4f}")
         print(f"  Magnitude uncertainty: {mc_results['mag_std'].mean().item():.4f}")
         print(f"  Confidence mean:       {mc_results['confidence'].mean().item():.4f}")
         print(f"  Confidence min/max:    {mc_results['confidence'].min().item():.4f} / "
               f"{mc_results['confidence'].max().item():.4f}")
+        print(f"  Rank stability:        {mc_results['rank_stability'].item():.4f}")
         
         # Attention weight visualization on last fold
         print("\nGenerating attention heatmap...")

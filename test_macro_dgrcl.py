@@ -420,6 +420,8 @@ class TestMacroDGRCL:
     
     def test_gradient_flow_full_model(self, sample_data, device):
         """Test gradients flow through the full model for both tasks."""
+        from train import compute_pairwise_ranking_loss, compute_log_scaled_mag_target
+        
         model = MacroDGRCL(
             num_stocks=sample_data['N_s'],
             num_macros=sample_data['N_m'],
@@ -434,14 +436,13 @@ class TestMacroDGRCL:
         
         dir_logits, mag_preds = model(stock_feat, macro_feat)
         
-        # Compute MTL loss
-        median_return = returns.median()
-        dir_target = (returns > median_return).float()
-        mag_target = torch.abs(returns)
+        # Compute pairwise ranking loss (direction) + SmoothL1 (magnitude)
+        scores = dir_logits.squeeze(-1)
+        loss_dir, _ = compute_pairwise_ranking_loss(scores, returns)
         
-        bce_loss = nn.BCEWithLogitsLoss()(dir_logits.squeeze(-1), dir_target)
-        mse_loss = nn.MSELoss()(mag_preds.squeeze(-1), mag_target)
-        total_loss = bce_loss + mse_loss
+        mag_target = compute_log_scaled_mag_target(returns)
+        loss_mag = nn.SmoothL1Loss()(mag_preds.squeeze(-1), mag_target)
+        total_loss = loss_dir + loss_mag
         
         total_loss.backward()
         
@@ -470,8 +471,7 @@ class TestEndToEnd:
             hidden_dim=sample_data['H']
         ).to(device)
         
-        bce_loss_fn = nn.BCEWithLogitsLoss()
-        mse_loss_fn = nn.MSELoss()
+        mse_loss_fn = nn.SmoothL1Loss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         
         stock_feat = sample_data['stock_features'].to(device)
@@ -484,14 +484,13 @@ class TestEndToEnd:
             macro_features=macro_feat,
             returns=returns,
             optimizer=optimizer,
-            bce_loss_fn=bce_loss_fn,
             mse_loss_fn=mse_loss_fn,
             mag_weight=1.0
         )
         
         assert not torch.isnan(torch.tensor(metrics['loss']))
         assert metrics['loss'] >= 0
-        assert 0 <= metrics['dir_accuracy'] <= 1
+        assert 0 <= metrics['rank_accuracy'] <= 1
         assert metrics['mag_mae'] >= 0
     
     def test_training_step_returns_all_metrics(self, sample_data, device):
@@ -506,8 +505,7 @@ class TestEndToEnd:
             hidden_dim=sample_data['H']
         ).to(device)
         
-        bce_loss_fn = nn.BCEWithLogitsLoss()
-        mse_loss_fn = nn.MSELoss()
+        mse_loss_fn = nn.SmoothL1Loss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         
         stock_feat = sample_data['stock_features'].to(device)
@@ -520,15 +518,14 @@ class TestEndToEnd:
             macro_features=macro_feat,
             returns=returns,
             optimizer=optimizer,
-            bce_loss_fn=bce_loss_fn,
             mse_loss_fn=mse_loss_fn,
         )
         
-        expected_keys = {'loss', 'loss_dir', 'loss_mag', 'dir_accuracy', 'mag_mae', 'grad_norm'}
+        expected_keys = {'loss', 'loss_dir', 'loss_mag', 'rank_accuracy', 'mag_mae', 'grad_norm'}
         assert set(metrics.keys()) == expected_keys
     
     def test_evaluate_returns_metrics(self, sample_data, device):
-        """Test that evaluate returns multi-task metrics."""
+        """Test that evaluate returns pairwise ranking + magnitude metrics."""
         from train import evaluate
         
         model = MacroDGRCL(
@@ -539,8 +536,7 @@ class TestEndToEnd:
             hidden_dim=sample_data['H']
         ).to(device)
         
-        bce_loss_fn = nn.BCEWithLogitsLoss()
-        mse_loss_fn = nn.MSELoss()
+        mse_loss_fn = nn.SmoothL1Loss()
         
         # Create a small validation set
         val_data = [
@@ -550,13 +546,12 @@ class TestEndToEnd:
         val_metrics = evaluate(
             model=model,
             data_loader=val_data,
-            bce_loss_fn=bce_loss_fn,
             mse_loss_fn=mse_loss_fn,
             device=device,
             mag_weight=1.0
         )
         
-        expected_keys = {'loss', 'loss_dir', 'loss_mag', 'dir_accuracy', 'mag_mae'}
+        expected_keys = {'loss', 'loss_dir', 'loss_mag', 'rank_accuracy', 'mag_mae'}
         assert set(val_metrics.keys()) == expected_keys
         assert val_metrics['loss'] >= 0
     
@@ -602,8 +597,7 @@ class TestEndToEnd:
             hidden_dim=sample_data['H']
         ).to(device)
         
-        bce_loss_fn = nn.BCEWithLogitsLoss()
-        mse_loss_fn = nn.MSELoss()
+        mse_loss_fn = nn.SmoothL1Loss()
         opt1 = torch.optim.AdamW(model1.parameters(), lr=1e-3)
         opt2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
         
@@ -612,9 +606,9 @@ class TestEndToEnd:
         returns = sample_data['returns'].to(device)
         
         m1 = train_step(model1, stock_feat, macro_feat, returns, opt1,
-                        bce_loss_fn, mse_loss_fn, mag_weight=0.1)
+                        mse_loss_fn, mag_weight=0.1)
         m2 = train_step(model2, stock_feat, macro_feat, returns, opt2,
-                        bce_loss_fn, mse_loss_fn, mag_weight=10.0)
+                        mse_loss_fn, mag_weight=10.0)
         
         # Direction loss should be very similar (not identical due to GPU non-determinism),
         # but total loss should clearly differ due to mag_weight
@@ -650,8 +644,8 @@ class TestMCDropout:
         )
         
         # With dropout=0.5 and 20 samples, std should be non-zero
-        assert results['dir_prob_std'].mean().item() > 0, \
-            "MC Dropout should produce non-zero variance in direction predictions"
+        assert results['dir_score_std'].mean().item() > 0, \
+            "MC Dropout should produce non-zero variance in direction scores"
         assert results['mag_std'].mean().item() > 0, \
             "MC Dropout should produce non-zero variance in magnitude predictions"
     
@@ -675,15 +669,19 @@ class TestMCDropout:
         )
         
         N_s = sample_data['N_s']
-        assert results['dir_prob_mean'].shape == (N_s,)
-        assert results['dir_prob_std'].shape == (N_s,)
+        assert results['dir_score_mean'].shape == (N_s,)
+        assert results['dir_score_std'].shape == (N_s,)
         assert results['mag_mean'].shape == (N_s,)
         assert results['mag_std'].shape == (N_s,)
         assert results['confidence'].shape == (N_s,)
+        assert results['rank_stability'].shape == ()
         
         # Confidence should be in (0, 1]
         assert (results['confidence'] > 0).all()
         assert (results['confidence'] <= 1).all()
+        
+        # Rank stability should be in [0, 1]
+        assert 0.0 <= results['rank_stability'].item() <= 1.0
 
 
 # =============================================================================

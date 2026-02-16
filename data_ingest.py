@@ -6,7 +6,7 @@ import torch
 from datetime import datetime, timedelta
 
 # --- Configuration ---
-START_DATE = "2020-01-01"  # Capture COVID crash + recovery + bear market + recent volatility
+START_DATE = "2021-01-01"  # 5-year balanced period: pre-bear, bear, recovery, bull
 END_DATE = datetime.now().strftime('%Y-%m-%d')
 DATA_DIR = "./data"
 PROCESSED_DIR = "./data/processed"
