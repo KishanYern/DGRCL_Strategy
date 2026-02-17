@@ -33,6 +33,3 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
-
-# Backtest Results
-backtest_results/
