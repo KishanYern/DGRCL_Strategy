@@ -716,5 +716,70 @@ class TestRollingZScore:
         )
 
 
+# =============================================================================
+# TEST: FEATURE ABLATION
+# =============================================================================
+
+class TestFeatureAblation:
+    
+    def test_slice_stock_features_helper(self):
+        """Test the slicing helper function."""
+        from train import slice_stock_features
+        
+        # Create dummy snapshots: 2 snapshots, 5 stocks, 10 time steps, 8 features
+        N_s, T, d_s = 5, 10, 8
+        snapshots = []
+        for _ in range(2):
+            stock = torch.randn(N_s, T, d_s)
+            macro = torch.randn(4, T, 4)
+            ret = torch.randn(N_s)
+            snapshots.append((stock, macro, ret))
+            
+        # Select indices [0, 7] -> first and last
+        indices = [0, 7]
+        sliced = slice_stock_features(snapshots, indices)
+        
+        # Check length preserved
+        assert len(sliced) == 2
+        
+        # Check dimensions
+        for i in range(2):
+            s_orig = snapshots[i][0]
+            s_new = sliced[i][0]
+            
+            assert s_new.shape == (N_s, T, 2)
+            
+            # Check content - feature 0 match
+            assert torch.allclose(s_new[:, :, 0], s_orig[:, :, 0])
+            # Check content - feature 1 (was 7) match
+            assert torch.allclose(s_new[:, :, 1], s_orig[:, :, 7])
+            
+            # Macro and returns intact
+            assert torch.allclose(sliced[i][1], snapshots[i][1])
+            assert torch.allclose(sliced[i][2], snapshots[i][2])
+
+    def test_model_with_reduced_dim(self, sample_data, device):
+        """Test model initialization and forward pass with reduced feature dim."""
+        # Simulate "pure_momentum" (3 features)
+        feature_dim = 3
+        
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=feature_dim,  # <--- REDUCED DIM
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        # Create input with matching dim
+        stock_feat = torch.randn(sample_data['N_s'], sample_data['T'], feature_dim).to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        
+        # Forward pass should work without error
+        dir_logits, mag_preds = model(stock_feat, macro_feat)
+        
+        assert dir_logits.shape == (sample_data['N_s'], 1)
+        assert mag_preds.shape == (sample_data['N_s'], 1)
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

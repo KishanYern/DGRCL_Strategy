@@ -24,6 +24,8 @@ from macro_dgrcl import MacroDGRCL
 
 
 # Visualization output directory
+# NOTE: This global constant is now overridden inside main() based on arguments
+# Leaving it here as a default fallback if functions are called directly without main()
 VIS_DIR = "./backtest_results"
 
 
@@ -761,13 +763,53 @@ def save_backtest_summary(all_fold_results: List[Dict], output_dir: str, dates=N
     print(f"\nSaved backtest summary: {filepath}")
 
 
+# =============================================================================
+# FEATURE ABLATION CONFIGURATION
+# =============================================================================
+
+ABLATION_CONFIGS = {
+    "baseline":        [0, 1, 2, 3, 4, 5, 6, 7],  # All 8 features
+    "stationary_only": [3, 4, 5, 6, 7],            # Log_Vol, RSI, MACD, Vol5, Returns
+    "pure_momentum":   [4, 5, 7],                  # RSI, MACD, Returns
+    "pure_volatility": [3, 6, 7],                  # Log_Vol, Vol5, Returns
+}
+
+
+def slice_stock_features(
+    snapshots: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    feature_indices: List[int]
+) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """
+    Slice stock features to keep only selected dimensions.
+    
+    Args:
+        snapshots: List of (stock, macro, returns) tuples
+        feature_indices: List of indices to keep (e.g. [0, 1, 7])
+        
+    Returns:
+        List of new tuples with sliced stock features
+    """
+    if not feature_indices:
+        return snapshots
+        
+    sliced_snapshots = []
+    for stock, macro, ret in snapshots:
+        # stock is [N_s, T, d_s] -> slice last dim
+        stock_sliced = stock[:, :, feature_indices]
+        sliced_snapshots.append((stock_sliced, macro, ret))
+        
+    return sliced_snapshots
+
 def main(
     use_real_data: bool = False,
     start_fold: int = 1,
     end_fold: Optional[int] = None,
     mag_weight: float = 0.1,
     force_cpu: bool = False,
-    use_amp: bool = True
+    use_amp: bool = True,
+    ablation: str = "baseline",
+    output_dir: str = "./backtest_results",
+    epochs: int = 100
 ):
     """
     Training loop with Multi-Task Learning.
@@ -780,13 +822,22 @@ def main(
         mag_weight: λ weight for magnitude loss (default 0.1)
         force_cpu: If True, force CPU mode (avoids GPU memory issues)
         use_amp: If True, enable mixed precision (FP16) training for memory efficiency
+        ablation: Feature ablation experiment name (one of ABLATION_CONFIGS keys)
+        output_dir: Directory to save results
     """
     # Hyperparameters
-    STOCK_DIM = 8  # ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
+    STOCK_DIM_FULL = 8  # ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
+    FEATURE_NAMES = ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
+    
+    # Feature ablation: select experiment
+    feature_indices = ABLATION_CONFIGS[ablation]
+    STOCK_DIM = len(feature_indices)
+    selected_names = [FEATURE_NAMES[i] for i in feature_indices]
+    print(f"Feature ablation: '{ablation}' → {STOCK_DIM} features: {selected_names}")
     MACRO_DIM = 4
     HIDDEN_DIM = 64
     WINDOW_SIZE = 60
-    NUM_EPOCHS = 100
+    NUM_EPOCHS = epochs
     LR = 1e-4
     WEIGHT_DECAY = 1e-3
     PATIENCE = 40  # Early stopping patience — allow more exploration
@@ -796,6 +847,10 @@ def main(
     TRAIN_SIZE = 200
     VAL_SIZE = 100
     FOLD_STEP = 50
+    
+    # Visualization output directory (use passed argument)
+    VIS_DIR = output_dir
+    os.makedirs(VIS_DIR, exist_ok=True)
     
     # Checkpoint path for fold-level resume
     CHECKPOINT_PATH = os.path.join(VIS_DIR, "fold_results.json")
@@ -866,7 +921,7 @@ def main(
         print("\n=== Generating Synthetic Data ===")
         total_timesteps = 500
         
-        stock_data = torch.randn(NUM_STOCKS, total_timesteps, STOCK_DIM)
+        stock_data = torch.randn(NUM_STOCKS, total_timesteps, STOCK_DIM_FULL)
         macro_data = torch.randn(NUM_MACROS, total_timesteps, MACRO_DIM)
         returns_data = torch.randn(NUM_STOCKS, total_timesteps) * 0.02
         
@@ -899,7 +954,10 @@ def main(
         except (json.JSONDecodeError, KeyError):
             print("Warning: corrupt checkpoint file, starting fresh")
     
-    for fold_idx, (train_data, val_data) in enumerate(folds):
+    for fold_idx, (train_data_fold, val_data_fold) in enumerate(folds):
+        # Apply feature ablation (slices stock_features dim for each snapshot)
+        train_data = slice_stock_features(train_data_fold, feature_indices)
+        val_data = slice_stock_features(val_data_fold, feature_indices)
         current_fold_num = fold_idx + 1
         
         # Skip folds outside requested range
@@ -1141,11 +1199,37 @@ if __name__ == "__main__":
         help="Force CPU mode (slower but avoids GPU memory issues)"
     )
     
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=100,
+        help="Number of training epochs (default: 100)"
+    )
+    
+    
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default="baseline",
+        choices=list(ABLATION_CONFIGS.keys()),
+        help="Feature ablation experiment (default: baseline, uses all 8 features)"
+    )
+    
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./backtest_results",
+        help="Directory to save visualization and checkpoint results (default: ./backtest_results)"
+    )
+    
     args = parser.parse_args()
     main(
         use_real_data=args.real_data,
         start_fold=args.start_fold,
         end_fold=args.end_fold,
         mag_weight=args.mag_weight,
-        force_cpu=args.cpu
+        force_cpu=args.cpu,
+        ablation=args.ablation,
+        output_dir=args.output_dir,
+        epochs=args.epochs
     )

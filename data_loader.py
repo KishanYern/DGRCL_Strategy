@@ -355,13 +355,31 @@ def get_sector_mapping(
     If real mapping file exists (ticker_sector_map.csv), use it.
     Otherwise, generate synthetic GICS sectors for testing.
     """
-    map_path = os.path.join(data_dir, "ticker_sector_map.csv")
+    candidate_paths = [
+        os.path.join(data_dir, "ticker_sector_map.csv"),            # Check <dir>/map.csv
+        os.path.join(data_dir, "processed", "ticker_sector_map.csv"), # Check <dir>/processed/map.csv (in case dir is ./data)
+        os.path.join(os.path.dirname(data_dir), "ticker_sector_map.csv"), # Check parent
+        os.path.join("./data/processed", "ticker_sector_map.csv"),  # Explicit absolute fallback
+        os.path.join("./data", "ticker_sector_map.csv")             # Fallback
+    ]
     
-    if os.path.exists(map_path):
+    map_path = None
+    for p in candidate_paths:
+        if os.path.exists(p):
+            map_path = p
+            break
+            
+    if map_path:
+        print(f"  Loading sector map from: {map_path}")
         df = pd.read_csv(map_path)
         # Expect columns 'Ticker', 'Sector'
-        if 'Ticker' in df.columns and 'Sector' in df.columns:
-            return pd.Series(df.Sector.values, index=df.Ticker).to_dict()
+        # Handle case where column names might vary (e.g. lowercase)
+        df.columns = [c.lower() for c in df.columns]
+        if 'ticker' in df.columns and 'sector' in df.columns:
+            # Handle potential duplicates
+            return pd.Series(df.sector.values, index=df.ticker).to_dict()
+        elif 'symbol' in df.columns and 'gics sector' in df.columns: # Support direct Wikipedia format
+             return pd.Series(df['gics sector'].values, index=df.symbol).to_dict()
     
     # Fallback: Synthetic Sectors
     print("Warning: No sector map found. Generating synthetic sectors for testing.")
