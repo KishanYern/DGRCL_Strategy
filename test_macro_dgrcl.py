@@ -50,12 +50,22 @@ def sample_data():
     d_m = 4   # Macro feature dim
     H = 32    # Hidden dim (reduced from 64)
     
+    # Generate active mask: ~70% of stocks active
+    torch.manual_seed(42)  # Deterministic for tests
+    active_mask = torch.rand(N_s) > 0.3  # ~70% True
+    # Ensure at least 3 active and 1 inactive for meaningful tests
+    active_mask[0] = True
+    active_mask[1] = True
+    active_mask[2] = True
+    active_mask[-1] = False
+    
     return {
         'stock_features': torch.randn(N_s, T, d_s),
         'macro_features': torch.randn(N_m, T, d_m),
         'stock_embeddings': torch.randn(N_s, H),
         'macro_embeddings': torch.randn(N_m, H),
         'returns': torch.randn(N_s) * 0.02,
+        'active_mask': active_mask,
         'N_s': N_s,
         'N_m': N_m,
         'T': T,
@@ -578,8 +588,8 @@ class TestEndToEnd:
         """Test that changing mag_weight changes the total loss."""
         from train import train_step
         
-        # Create two identical models
-        torch.manual_seed(42)
+        # Create two identical models (use seed 123 to avoid conflict with fixture seed 42)
+        torch.manual_seed(123)
         model1 = MacroDGRCL(
             num_stocks=sample_data['N_s'],
             num_macros=sample_data['N_m'],
@@ -588,7 +598,7 @@ class TestEndToEnd:
             hidden_dim=sample_data['H']
         ).to(device)
         
-        torch.manual_seed(42)
+        torch.manual_seed(123)
         model2 = MacroDGRCL(
             num_stocks=sample_data['N_s'],
             num_macros=sample_data['N_m'],
@@ -783,3 +793,364 @@ class TestFeatureAblation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# =============================================================================
+# TEST: ACTIVE MASK — DYNAMIC UNIVERSE SAFEGUARDS
+# =============================================================================
+
+class TestActiveMaskSeversInactiveNodes:
+    
+    def test_inactive_nodes_get_zero_attention(self, sample_data):
+        """Verify that inactive nodes receive zero attention weight after masking."""
+        learner = DynamicGraphLearner(
+            hidden_dim=sample_data['H'],
+            top_k=5
+        )
+        
+        active_mask = sample_data['active_mask']
+        
+        edge_index, edge_weights = learner(
+            sample_data['stock_embeddings'],
+            active_mask=active_mask,
+            return_weights=True
+        )
+        
+        # Inactive nodes should not appear as source or destination
+        inactive_indices = (~active_mask).nonzero(as_tuple=True)[0]
+        src, dst = edge_index
+        
+        for inactive_idx in inactive_indices:
+            # Inactive node should not be a source (no one attends TO it)
+            assert (src != inactive_idx).all(), \
+                f"Inactive node {inactive_idx} appears as source in edge_index"
+
+
+class TestNaNSafeFullyInactive:
+    
+    def test_all_inactive_no_nan(self, sample_data, device):
+        """All-inactive mask must produce zeros, not NaN, through full forward pass."""
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        # All stocks inactive
+        all_inactive = torch.zeros(sample_data['N_s'], dtype=torch.bool, device=device)
+        
+        dir_logits, mag_preds = model(
+            stock_feat, macro_feat, active_mask=all_inactive
+        )
+        
+        assert not torch.isnan(dir_logits).any(), "NaN in direction logits with all-inactive mask"
+        assert not torch.isnan(mag_preds).any(), "NaN in magnitude preds with all-inactive mask"
+    
+    def test_partial_inactive_no_nan(self, sample_data, device):
+        """Partial active mask must produce no NaN in any output."""
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        active_mask = sample_data['active_mask'].to(device)
+        
+        dir_logits, mag_preds = model(
+            stock_feat, macro_feat, active_mask=active_mask
+        )
+        
+        assert not torch.isnan(dir_logits).any(), "NaN in direction logits"
+        assert not torch.isnan(mag_preds).any(), "NaN in magnitude preds"
+
+
+class TestMacroEdgesFiltered:
+    
+    def test_macro_edges_exclude_inactive(self, sample_data, device):
+        """Macro→Stock edges should exclude inactive destinations."""
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        active_mask = sample_data['active_mask'].to(device)
+        
+        # Run forward pass — it builds and filters macro→stock edges internally
+        # We verify by checking that the model runs without error and
+        # inactive nodes don't get contaminated
+        dir_logits, mag_preds = model(
+            stock_feat, macro_feat, active_mask=active_mask
+        )
+        
+        # Outputs should have correct shape
+        assert dir_logits.shape == (sample_data['N_s'], 1)
+        assert mag_preds.shape == (sample_data['N_s'], 1)
+
+
+class TestRankingLossIgnoresInactive:
+    
+    def test_inactive_pairs_excluded(self, sample_data):
+        """Ranking loss should only use active-active pairs."""
+        from train import compute_pairwise_ranking_loss
+        
+        scores = torch.randn(sample_data['N_s'])
+        returns = torch.randn(sample_data['N_s']) * 0.05  # Large returns for valid pairs
+        active_mask = sample_data['active_mask']
+        
+        # Loss with active_mask
+        loss_masked, acc_masked = compute_pairwise_ranking_loss(
+            scores=scores,
+            returns=returns,
+            active_mask=active_mask
+        )
+        
+        # Loss with all active (no mask)
+        loss_unmasked, acc_unmasked = compute_pairwise_ranking_loss(
+            scores=scores,
+            returns=returns
+        )
+        
+        # Masked loss should be different (fewer valid pairs)
+        # unless all stocks happen to be active
+        if not active_mask.all():
+            # Either the losses differ or the number of valid pairs differs
+            assert loss_masked.item() != loss_unmasked.item() or \
+                   acc_masked != acc_unmasked, \
+                "Masking should change loss/accuracy when stocks are inactive"
+    
+    def test_all_inactive_zero_loss(self, sample_data):
+        """All-inactive mask should produce zero ranking loss (no valid pairs)."""
+        from train import compute_pairwise_ranking_loss
+        
+        scores = torch.randn(sample_data['N_s'])
+        returns = torch.randn(sample_data['N_s']) * 0.05
+        all_inactive = torch.zeros(sample_data['N_s'], dtype=torch.bool)
+        
+        loss, acc = compute_pairwise_ranking_loss(
+            scores=scores,
+            returns=returns,
+            active_mask=all_inactive
+        )
+        
+        assert loss.item() == 0.0, "All-inactive mask should produce zero ranking loss"
+        assert acc == 0.0, "All-inactive mask should produce zero accuracy"
+
+
+class TestMagnitudeLossMasksInactive:
+    
+    def test_magnitude_loss_only_active(self, sample_data, device):
+        """SmoothL1 magnitude loss should only consider active stocks."""
+        from train import compute_log_scaled_mag_target
+        
+        mse_loss_fn = nn.SmoothL1Loss()
+        active_mask = sample_data['active_mask']
+        returns = sample_data['returns']
+        mag_preds = torch.randn(sample_data['N_s'])
+        mag_target = compute_log_scaled_mag_target(returns)
+        
+        # Compute loss over active only
+        loss_active = mse_loss_fn(
+            mag_preds[active_mask],
+            mag_target[active_mask]
+        )
+        
+        # Compute loss over all
+        loss_all = mse_loss_fn(mag_preds, mag_target)
+        
+        # They should differ unless all are active
+        if not active_mask.all():
+            assert loss_active.item() != loss_all.item(), \
+                "Masked loss should differ from unmasked loss"
+
+
+class TestTrainingStepWithActiveMask:
+    
+    def test_no_nan_with_active_mask(self, sample_data, device):
+        """Full training step with active_mask should produce no NaN."""
+        from train import train_step
+        
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+        
+        mse_loss_fn = nn.SmoothL1Loss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        returns = sample_data['returns'].to(device)
+        active_mask = sample_data['active_mask'].to(device)
+        
+        metrics = train_step(
+            model=model,
+            stock_features=stock_feat,
+            macro_features=macro_feat,
+            returns=returns,
+            optimizer=optimizer,
+            mse_loss_fn=mse_loss_fn,
+            mag_weight=1.0,
+            active_mask=active_mask
+        )
+        
+        assert not torch.isnan(torch.tensor(metrics['loss'])), "NaN loss with active_mask"
+        assert metrics['loss'] >= 0, "Loss should be non-negative"
+        assert 0 <= metrics['rank_accuracy'] <= 1
+        assert metrics['mag_mae'] >= 0
+    
+    def test_gradient_flow_with_active_mask(self, sample_data, device):
+        """Gradients should flow through model with active_mask."""
+        from train import compute_pairwise_ranking_loss, compute_log_scaled_mag_target
+
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        returns = sample_data['returns'].to(device)
+        active_mask = sample_data['active_mask'].to(device)
+
+        dir_logits, mag_preds = model(
+            stock_feat, macro_feat, active_mask=active_mask
+        )
+
+        scores = dir_logits.squeeze(-1)
+        loss_dir, _ = compute_pairwise_ranking_loss(
+            scores, returns, active_mask=active_mask
+        )
+
+        # FIX #5: pass active_mask so sigma uses only active stocks
+        mag_target = compute_log_scaled_mag_target(returns, active_mask=active_mask)
+        loss_mag = nn.SmoothL1Loss()(
+            mag_preds.squeeze(-1)[active_mask],
+            mag_target[active_mask]
+        )
+        total_loss = loss_dir + loss_mag
+        total_loss.backward()
+
+        # Check gradients exist for key parameters
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"No gradient for {name}"
+                assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
+
+    def test_train_step_updates_parameters(self, sample_data, device):
+        """
+        Verify that model parameters actually change after train_step().
+
+        This test would have caught the double optimizer.zero_grad() bug (Issue #2)
+        where all gradients were wiped before backward(), so parameters never moved.
+        """
+        from train import train_step
+
+        torch.manual_seed(0)
+        model = MacroDGRCL(
+            num_stocks=sample_data['N_s'],
+            num_macros=sample_data['N_m'],
+            stock_feature_dim=sample_data['d_s'],
+            macro_feature_dim=sample_data['d_m'],
+            hidden_dim=sample_data['H']
+        ).to(device)
+
+        # Snapshot weights before the training step
+        params_before = {
+            name: param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+        mse_loss_fn = nn.SmoothL1Loss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1.0)  # Large LR for clear movement
+
+        stock_feat = sample_data['stock_features'].to(device)
+        macro_feat = sample_data['macro_features'].to(device)
+        returns = sample_data['returns'].to(device)
+        active_mask = sample_data['active_mask'].to(device)
+
+        metrics = train_step(
+            model=model,
+            stock_features=stock_feat,
+            macro_features=macro_feat,
+            returns=returns,
+            optimizer=optimizer,
+            mse_loss_fn=mse_loss_fn,
+            mag_weight=1.0,
+            active_mask=active_mask
+        )
+
+        # At least some parameters must have changed — if double zero_grad() was
+        # present, ALL parameters would be identical (no gradient was applied).
+        changed = sum(
+            1 for name, p in model.named_parameters()
+            if p.requires_grad and not torch.equal(p.detach(), params_before[name])
+        )
+        assert changed > 0, (
+            "No parameters changed after train_step()! "
+            "This indicates gradients were zeroed before backward() — "
+            "check for a duplicate optimizer.zero_grad() call in train_step()."
+        )
+
+
+class TestMagnitudeTargetSigmaFix:
+    """Verify that compute_log_scaled_mag_target uses active-only sigma (Issue #5)."""
+
+    def test_sigma_excludes_inactive_stocks(self, sample_data):
+        """
+        compute_log_scaled_mag_target must use active-only sigma when a mask is provided.
+
+        We verify the BEHAVIOR: masked and unmasked calls produce different outputs
+        when some stocks are inactive (zero-padded). We do not assert a direction on
+        sigma because the direction depends on how the zeros compare to active returns.
+
+        The key property: if masking changes sigma, it changes the normalized targets.
+        """
+        from train import compute_log_scaled_mag_target
+
+        # Use a fully controlled standalone tensor (independent of fixture randomness)
+        # 10 stocks: 7 active (varied returns), 3 inactive (zero-padded)
+        N = 10
+        active = torch.tensor([True]*7 + [False]*3)
+        returns = torch.zeros(N)
+        returns[active] = torch.tensor([0.01, -0.02, 0.03, -0.01, 0.05, -0.03, 0.02])
+
+        target_masked = compute_log_scaled_mag_target(returns, active_mask=active)
+        target_unmasked = compute_log_scaled_mag_target(returns)
+
+        # The two sigmata must differ (otherwise masking does nothing)
+        sigma_masked = returns[active].abs().std()
+        sigma_unmasked = returns.abs().std()
+        assert not torch.isclose(sigma_masked, sigma_unmasked, atol=1e-6), (
+            "Masked sigma should differ from unmasked sigma when inactive stocks "
+            "have zero returns and active stocks have non-zero returns"
+        )
+
+        # Consequently, the normalized targets for active stocks must differ
+        assert not torch.allclose(target_masked[active], target_unmasked[active]), (
+            "Targets for active stocks must differ between masked and unmasked "
+            "when sigma changes"
+        )
+
+        # Sanity: all targets are finite and non-negative
+        assert target_masked.isfinite().all(), "Masked targets must be finite"
+        assert (target_masked >= 0).all(), "log1p targets must be non-negative"

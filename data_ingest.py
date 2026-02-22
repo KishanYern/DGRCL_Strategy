@@ -6,10 +6,11 @@ import torch
 from datetime import datetime, timedelta
 
 # --- Configuration ---
-START_DATE = "2021-01-01"  # 5-year balanced period: pre-bear, bear, recovery, bull
+START_DATE = "2007-01-01"  # Full historical backtest window
 END_DATE = datetime.now().strftime('%Y-%m-%d')
 DATA_DIR = "./data"
 PROCESSED_DIR = "./data/processed"
+HISTORICAL_CSV = "./data/sp500_historical.csv"
 
 MACRO_TICKERS = {
     "Energy": "CL=F",
@@ -62,23 +63,179 @@ def rolling_zscore_normalize(df, window=60):
         normalized[col] = (df[col] - rolling_mean) / rolling_std
     return normalized
 
+
+# =============================================================================
+# HISTORICAL CONSTITUENT LOADING
+# =============================================================================
+
+def generate_mock_historical_constituents(csv_path: str):
+    """
+    Generate a realistic mock sp500_historical.csv for development.
+    
+    Produces quarterly entries from 2007-2025 with realistic churn:
+    - Starts with ~490 tickers
+    - ~3-7 adds/removes per quarter
+    - ~600 total unique tickers across the full timeline
+    """
+    import random
+    random.seed(42)
+    
+    # Pool of realistic ticker symbols (mix of current and historical S&P 500)
+    ticker_pool = [
+        # Technology
+        "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA",
+        "AVGO", "ORCL", "CSCO", "ADBE", "CRM", "ACN", "IBM", "INTC",
+        "AMD", "QCOM", "TXN", "NOW", "INTU", "AMAT", "MU", "LRCX",
+        "ADI", "KLAC", "SNPS", "CDNS", "MCHP", "FTNT", "PANW", "CRWD",
+        "NFLX", "PYPL", "SQ", "SHOP", "UBER", "ABNB", "SNAP", "PINS",
+        # Healthcare
+        "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT",
+        "DHR", "BMY", "AMGN", "GILD", "MDT", "SYK", "ISRG", "REGN",
+        "VRTX", "BSX", "ZBH", "BAX", "BDX", "EW", "CI", "HUM",
+        "CVS", "MCK", "CAH", "ABC", "BIIB", "ILMN", "IQV", "DXCM",
+        # Financials
+        "BRK-B", "JPM", "V", "MA", "BAC", "WFC", "GS", "MS",
+        "SPGI", "BLK", "C", "AXP", "SCHW", "CB", "MMC", "PGR",
+        "ICE", "CME", "AON", "MET", "AIG", "PRU", "TRV", "ALL",
+        "AFL", "USB", "PNC", "TFC", "COF", "FIS", "FISV", "DFS",
+        # Consumer Discretionary
+        "HD", "MCD", "NKE", "LOW", "SBUX", "TJX", "BKNG", "MAR",
+        "HLT", "ORLY", "AZO", "ROST", "DHI", "LEN", "PHM", "GM",
+        "F", "APTV", "EBAY", "ETSY", "BBY", "DG", "DLTR", "KMX",
+        # Industrials
+        "GE", "CAT", "HON", "UNP", "UPS", "RTX", "BA", "LMT",
+        "DE", "MMM", "GD", "NOC", "WM", "RSG", "CSX", "NSC",
+        "EMR", "ETN", "ITW", "ROK", "PH", "CMI", "FDX", "DAL",
+        "LUV", "AAL", "UAL", "XPO", "FAST", "PCAR", "IR", "DOV",
+        # Consumer Staples
+        "PG", "KO", "PEP", "COST", "WMT", "PM", "MO", "MDLZ",
+        "CL", "EL", "KMB", "GIS", "K", "SJM", "HSY", "HRL",
+        "CPB", "MKC", "CHD", "CLX", "KR", "SYY", "ADM", "TSN",
+        # Energy
+        "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO",
+        "PXD", "OXY", "HES", "DVN", "FANG", "HAL", "BKR", "KMI",
+        "WMB", "OKE", "CTRA", "MRO", "APA", "TRGP",
+        # Utilities
+        "NEE", "DUK", "SO", "D", "AEP", "SRE", "EXC", "XEL",
+        "ED", "WEC", "DTE", "AWK", "ES", "PPL", "FE", "AEE",
+        "CMS", "CNP", "EVRG", "ATO", "NI", "PNW", "LNT",
+        # Real Estate
+        "AMT", "PLD", "CCI", "EQIX", "PSA", "SPG", "O", "DLR",
+        "WELL", "AVB", "EQR", "VTR", "ARE", "MAA", "ESS", "UDR",
+        "HST", "KIM", "REG", "FRT", "BXP", "SLG",
+        # Materials
+        "LIN", "APD", "SHW", "ECL", "FCX", "NEM", "NUE", "VMC",
+        "MLM", "DOW", "DD", "PPG", "CE", "ALB", "CF", "MOS",
+        "IFF", "EMN", "IP", "PKG", "SEE", "AVY", "BLL",
+        # Communication Services
+        "DIS", "CMCSA", "T", "VZ", "TMUS", "CHTR", "EA", "ATVI",
+        "WBD", "PARA", "FOXA", "FOX", "NWSA", "NWS", "OMC", "IPG",
+        "TTWO", "LYV", "MTCH",
+        # Historical tickers (removed from S&P 500 over time - no duplicates)
+        "XRX", "HPQ", "TWX", "YHOO", "DELL",
+        "MER", "LEH", "BSC", "WB", "FNM", "FRE",
+        "CIT", "CBE", "EDS", "UST", "SGP", "WYE",
+        "MBI", "ABK", "CFC", "JAVA", "SIRI", "TIE", "JNY",
+        "DJ", "TE", "HPC", "ROH", "ASH", "EK", "PBI",
+        "WIN", "JCP", "S", "SHLD", "ANR", "BEAM", "LO",
+        "JOY", "ARG", "PLL", "DNR", "DO", "CHK", "FTR",
+        "ENDP", "RAD", "BBBY", "KSS", "M", "GPS", "LUMN",
+        "WYNN", "LB", "COTY", "HBI", "IVZ", "BEN", "FHN",
+        "PBCT", "CMA", "ZION", "SIVB", "FRC",
+        # More recent additions
+        "PLTR", "DDOG", "ZS", "SNOW", "NET", "TEAM", "MDB",
+        "COIN", "RIVN", "LCID", "CEG", "CARR", "OTIS", "CTVA",
+        "DOW", "IR", "BKR", "TECH", "MRNA", "ENPH", "SEDG",
+        "GNRC", "MPWR", "ON", "SMCI", "DECK", "PODD", "AXON",
+    ]
+    
+    # Deduplicate
+    ticker_pool = sorted(list(set(ticker_pool)))
+    
+    # Start with ~490 tickers from the pool
+    current_members = set(random.sample(ticker_pool, min(490, len(ticker_pool))))
+    remaining_pool = set(ticker_pool) - current_members
+    
+    rows = []
+    dates = pd.date_range("2007-01-01", "2025-12-31", freq="QS")
+    
+    for date in dates:
+        # Record current snapshot
+        rows.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "tickers": ",".join(sorted(current_members))
+        })
+        
+        # Simulate quarterly churn: remove 3-7, add 3-7
+        n_remove = random.randint(3, 7)
+        n_add = random.randint(3, 7)
+        
+        removable = list(current_members)
+        if len(removable) > n_remove:
+            removed = set(random.sample(removable, n_remove))
+            current_members -= removed
+            remaining_pool |= removed
+        
+        addable = list(remaining_pool)
+        if len(addable) > n_add:
+            added = set(random.sample(addable, n_add))
+            current_members |= added
+            remaining_pool -= added
+    
+    df = pd.DataFrame(rows)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    df.to_csv(csv_path, index=False)
+    print(f"Generated mock historical constituents: {csv_path}")
+    print(f"  {len(dates)} quarterly snapshots, {len(ticker_pool)} total unique tickers")
+    return df
+
+
+def load_historical_constituents(csv_path: str = None):
+    """
+    Load point-in-time S&P 500 constituent data.
+    
+    Args:
+        csv_path: Path to sp500_historical.csv (columns: date, tickers)
+    
+    Returns:
+        constituent_df: DataFrame with 'date' and 'tickers' columns
+        all_tickers: Sorted list of every unique ticker across the timeline
+    """
+    if csv_path is None:
+        csv_path = HISTORICAL_CSV
+    
+    if not os.path.exists(csv_path):
+        print(f"Historical constituent file not found at {csv_path}")
+        print("Generating mock historical constituents for development...")
+        generate_mock_historical_constituents(csv_path)
+    
+    df = pd.read_csv(csv_path)
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Extract superset of all unique tickers
+    all_tickers = set()
+    for tickers_str in df['tickers']:
+        all_tickers.update(tickers_str.split(','))
+    
+    all_tickers = sorted(all_tickers)
+    
+    print(f"Loaded historical constituents from {csv_path}")
+    print(f"  Date range: {df['date'].min()} to {df['date'].max()}")
+    print(f"  {len(df)} snapshots, {len(all_tickers)} unique tickers (superset)")
+    
+    return df, all_tickers
+
+
 # --- Main Execution ---
-def fetch_sp500_tickers():
-    print("Scraping S&P 500 tickers from Wikipedia...")
-    import requests
-    from io import StringIO
-    
-    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-    headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'}
-    
-    response = requests.get(url, headers=headers)
-    table = pd.read_html(StringIO(response.text))
-    df = table[0]
-    # Replace dots with dashes for Yahoo (e.g. BRK.B -> BRK-B)
-    tickers = df['Symbol'].str.replace('.', '-', regex=False).tolist()
-    return tickers
 
 def process_ticker_data(ticker, is_macro=False):
+    """
+    Download and process a single ticker.
+    
+    CRITICAL: All indicators and normalization are computed on VALID data only.
+    Zero-fill reindexing is NOT done here — it happens later in main() after
+    all processing is complete (Process-First, Reindex-Last pattern).
+    """
     try:
         df = yf.download(ticker, start=START_DATE, end=END_DATE, progress=False, auto_adjust=True)
         if df.empty:
@@ -88,11 +245,11 @@ def process_ticker_data(ticker, is_macro=False):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # Basic Features
+        # Basic Features — computed on valid data only
         df['Returns'] = np.log(df['Close'] / df['Close'].shift(1))
         df['Log_Vol'] = np.log(df['Volume'] + 1)
         
-        # Technicals
+        # Technicals — computed on valid data only
         df['RSI_14'] = calculate_rsi(df['Close'])
         macd, _ = calculate_macd(df['Close'])
         df['MACD'] = macd
@@ -110,15 +267,17 @@ def process_ticker_data(ticker, is_macro=False):
             cols = ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
             df = df[cols]
 
-        # Apply Rolling Z-Score Normalization
-        # Critical: Neural networks require inputs scaled to ~N(0,1)
+        # Apply Rolling Z-Score Normalization on VALID data only
+        # Critical: This must happen BEFORE any zero-fill reindexing
         df = rolling_zscore_normalize(df, window=60)
         
+        # Drop NaN rows from indicator warmup (RSI, MACD, rolling stats)
         df = df.dropna()
         return df
     except Exception as e:
         print(f"Error processing {ticker}: {e}")
         return None
+
 
 def main():
     if os.path.exists(PROCESSED_DIR):
@@ -126,8 +285,11 @@ def main():
         shutil.rmtree(PROCESSED_DIR)
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     
-    # 1. Fetch Macro Data
-    print("Fetching Macro Nodes...")
+    # 1. Load historical constituent data → extract superset
+    constituent_df, all_tickers = load_historical_constituents()
+    
+    # 2. Fetch Macro Data
+    print("\nFetching Macro Nodes...")
     macro_data = {}
     for name, ticker in MACRO_TICKERS.items():
         df = process_ticker_data(ticker, is_macro=True)
@@ -136,87 +298,125 @@ def main():
     
     print(f"Successfully fetched {len(macro_data)} macro nodes.")
 
-    # 2. Fetch Stock Data
-    tickers = fetch_sp500_tickers()
-    print(f"Found {len(tickers)} S&P 500 tickers. Starting download (this may take time)...")
+    # 3. Fetch Stock Data for entire superset
+    print(f"\nDownloading data for {len(all_tickers)} tickers (full superset)...")
+    print("This may take significant time for the first run.\n")
     
     stock_data = {}
+    failed_tickers = []
     
-    MAX_HISTORY = 1000  # Require ~4 years of data to avoid recent IPOs truncating common range
-    
-    # For PoC, limit to first 50 to save time/bandwidth, remove slice [:] for full run
-    for ticker in tickers: 
+    for i, ticker in enumerate(all_tickers):
         df = process_ticker_data(ticker, is_macro=False)
-        if df is not None:
-            if len(df) > MAX_HISTORY:
-                stock_data[ticker] = df
-                if len(stock_data) % 50 == 0:
-                    print(f"Processed {ticker} - {len(df)} rows")
-            else:
-                # print(f"Skipping {ticker}: Insufficient history ({len(df)} < {MAX_HISTORY})")
-                pass
+        if df is not None and len(df) > 0:
+            stock_data[ticker] = df
+        else:
+            failed_tickers.append(ticker)
+        
+        if (i + 1) % 50 == 0:
+            print(f"  Processed {i+1}/{len(all_tickers)} tickers "
+                  f"({len(stock_data)} valid, {len(failed_tickers)} failed)")
     
-    # 3. CRITICAL: Align all dataframes to common date index
-    # Different tickers have different histories (VIX needs 200 days for MA_200)
-    # This prevents tensor shape mismatches during training
-    print("\nAligning all data to common date range...")
+    print(f"\nDownload complete: {len(stock_data)} valid stocks, "
+          f"{len(failed_tickers)} failed/empty")
     
-    # Find intersection of all date indices
-    all_indices = [df.index for df in macro_data.values()] + [df.index for df in stock_data.values()]
-    
-    if not all_indices:
-        print("ERROR: No valid data found!")
+    if not stock_data:
+        print("ERROR: No valid stock data found!")
         return
     
-    common_index = all_indices[0]
+    # 4. Build UNION date index (instead of intersection)
+    # This ensures we have dates for all tickers, even those with partial histories
+    print("\nBuilding union date index...")
+    
+    all_indices = [df.index for df in macro_data.values()] + \
+                  [df.index for df in stock_data.values()]
+    
+    # Union: every date that ANY ticker has data for
+    union_index = all_indices[0]
     for idx in all_indices[1:]:
-        common_index = common_index.intersection(idx)
+        union_index = union_index.union(idx)
     
-    common_index = common_index.sort_values()
-    print(f"Common date range: {common_index[0]} to {common_index[-1]} ({len(common_index)} trading days)")
+    union_index = union_index.sort_values()
+    print(f"Union date range: {union_index[0]} to {union_index[-1]} "
+          f"({len(union_index)} trading days)")
     
-    if len(common_index) < 200:
-        print("WARNING: Common date range is very short. Consider using fewer macro indicators or longer history.")
+    # 5. PROCESS-FIRST, REINDEX-LAST
+    # All indicators and normalization were computed on valid data in process_ticker_data().
+    # Now we reindex to the union and zero-fill as the FINAL step.
     
-    # 3.5 Cross-Sectional Mean Subtraction (Market Neutrality)
+    # 5a. Cross-Sectional Mean Subtraction on valid returns first
     print("\nApplying Cross-Sectional Mean Subtraction to Returns...")
-    # Create temporary DataFrame of just returns aligned to common index
-    clean_stock_data = {}
+    
+    # Build returns matrix aligned to union index (with NaN for missing dates)
+    returns_matrix = pd.DataFrame(index=union_index)
     for ticker, df in stock_data.items():
-        clean_stock_data[ticker] = df.loc[common_index].copy()
+        # Reindex but use NaN (not zero) for the cross-sectional mean calculation
+        aligned = df['Returns'].reindex(union_index)
+        returns_matrix[ticker] = aligned
     
-    # Extract returns matrix [Time, Stocks]
-    returns_matrix = pd.DataFrame({
-        ticker: df['Returns'] 
-        for ticker, df in clean_stock_data.items()
-    })
+    # Cross-sectional mean ignoring NaN (only active stocks contribute)
+    market_return = returns_matrix.mean(axis=1)  # NaN-aware mean
     
-    # Calculate cross-sectional mean (market return proxy)
-    market_return = returns_matrix.mean(axis=1)
+    # Subtract market return from each stock's valid returns
+    demeaned_returns = {}
+    for ticker in stock_data:
+        valid_returns = stock_data[ticker]['Returns'].copy()
+        # Only subtract on dates where this stock has valid data
+        common_dates = valid_returns.index.intersection(market_return.index)
+        valid_returns.loc[common_dates] -= market_return.loc[common_dates]
+        demeaned_returns[ticker] = valid_returns
     
-    # Subtract market return from each stock
-    for ticker in clean_stock_data:
-        clean_stock_data[ticker]['Returns'] -= market_return
-        
     print("Returns are now market-neutral (cross-sectional mean subtracted).")
     
-    # 4. Align and save all data
+    # 5b. Reindex and zero-fill as the ABSOLUTE FINAL step
+    print("\nReindexing all data to union index and zero-filling...")
+    
+    # Save macro data (reindexed + zero-filled)
     for name, df in macro_data.items():
-        aligned_df = df.loc[common_index]
+        aligned_df = df.reindex(union_index).fillna(0)
         aligned_df.to_csv(f"{PROCESSED_DIR}/macro_{name}.csv")
     
+    # Save stock data (reindexed + zero-filled, with demeaned returns applied)
     valid_stocks = []
-    for ticker, df in clean_stock_data.items():
-        # df is already aligned and demeaned
-        df.to_csv(f"{PROCESSED_DIR}/stock_{ticker}.csv")
+    for ticker, df in stock_data.items():
+        df_final = df.copy()
+
+        # FIX #3: Re-apply rolling z-score to the demeaned returns so the
+        # Returns FEATURE stays on the same ~N(0,1) scale as every other
+        # feature column going into the LSTM.
+        #
+        # Problem: rolling_zscore_normalize() already ran in process_ticker_data(),
+        # but cross-sectional demeaning then overwrites df['Returns'] with a raw
+        # demeaned log-return (~0.002 scale), breaking feature consistency.
+        #
+        # Solution: treat the demeaned return as a fresh raw series and
+        # re-normalize it with the same rolling-z approach.
+        raw_demeaned_series = demeaned_returns[ticker]
+        # Build a single-column DataFrame so rolling_zscore_normalize works
+        raw_ret_df = pd.DataFrame({'Returns': raw_demeaned_series})
+        renorm = rolling_zscore_normalize(raw_ret_df, window=60)['Returns']
+        df_final['Returns'] = renorm
+
+        # Reindex to union and THEN zero-fill (Process-First, Reindex-Last)
+        aligned_df = df_final.reindex(union_index).fillna(0)
+        aligned_df.to_csv(f"{PROCESSED_DIR}/stock_{ticker}.csv")
         valid_stocks.append(ticker)
     
-    # Save common index for reference
-    pd.Series(common_index).to_csv(f"{PROCESSED_DIR}/common_index.txt", index=False, header=False)
+    # Save the ordered superset ticker list
+    pd.Series(valid_stocks).to_csv(
+        f"{PROCESSED_DIR}/superset_tickers.csv", index=False, header=False
+    )
     
-    print(f"\nIngestion Complete. Processed {len(valid_stocks)} stocks and {len(macro_data)} macro nodes.")
-    print(f"All data aligned to {len(common_index)} common trading days.")
-    print(f"Data saved to {PROCESSED_DIR}")
+    # Save union index for reference
+    pd.Series(union_index).to_csv(
+        f"{PROCESSED_DIR}/common_index.txt", index=False, header=False
+    )
+    
+    print(f"\nIngestion Complete.")
+    print(f"  Processed {len(valid_stocks)} stocks and {len(macro_data)} macro nodes.")
+    print(f"  All data aligned to {len(union_index)} trading days (union index).")
+    print(f"  Data saved to {PROCESSED_DIR}")
+    print(f"  Superset tickers saved to {PROCESSED_DIR}/superset_tickers.csv")
+
 
 if __name__ == "__main__":
     main()
