@@ -1,60 +1,74 @@
 # Deep Evaluation & Future Roadmap (v1.5)
+*Last updated: 2026-02-22 after full 90-fold walk-forward run (2007–2026)*
 
 ## 1. Deep Evaluation of Current Performance
 
-### Overall Metrics (2021-2026 Backtest)
-*   **Mean Rank Accuracy**: **58.2%** (Baseline: 50%)
-    *   This indicates a strong edge. Correctly ranking ~6 out of 10 pairs consistently is sufficient for a profitable long-short strategy.
-*   **Mean Magnitude MAE**: **0.339** (Log-Scale)
-    *   The model's magnitude predictions are stable and low-variance, unlike v1.4.
+### Overall Metrics (Full 90-Fold Run: 2007–2026)
+*   **Mean Rank Accuracy**: **57.5%** (Baseline: 50%)
+    *   Statistically robust over 19 years of OOS data including GFC and COVID-19. Correctly ranking ~57–60% of same-sector pairs is sufficient for a profitable sector-neutral long-short strategy.
+*   **Mean Val Loss**: **0.4615 ± 0.0157**
+*   **Mean Magnitude MAE**: **0.3517** (Log-Scale); spikes to >0.41 in high-volatility regimes.
+*   **NaN Training Folds**: 7/90 (7.8%) — concentrated in GFC and COVID regimes (see `backtest_findings.md`).
 
 ### Regime Analysis
 The model exhibits performance cyclicity correlated with market regimes:
 
-| Regime | Period (Approx) | Rank Accuracy | Assessment |
+| Regime | Approx. Folds | Mean Rank Acc. | Assessment |
 | :--- | :--- | :--- | :--- |
-| **Recovery / Bull** | 2021 - Mid 2022 | **~60%** | **Strongest**. The model excels when trends are clear and sector rotation is orderly. |
-| **Bear / Transition** | Mid 2022 - 2023 | **~59%** | **Resilient**. The pairwise ranking approach neutralizes market beta, allowing it to find relative winners even in down markets. |
-| **Consolidation** | 2023 - 2024 | **~56%** | **Weakest**. In choppy, range-bound markets, sector dispersion decreases, making ranking harder and noisier. |
-| **Late Cycle** | 2025 - Present | **~57.5%** | **Moderate**. As trends mature and volatility decreases, the edge compresses slightly but remains positive. |
+| **Recovery / Bull** | 21–35 | **~57.6%** | **Stable**. Clear trends and orderly sector rotation — most learnable. |
+| **High-Vol / Crisis** | 36–39, 59–61 | **~53–55%** | **Most degraded**. NaN train losses; model under-trains entering these folds. |
+| **Post-Crisis Trending** | 62–90 | **~57.8%** | **Strongest individual folds** (F69: 61.0%, F76: 60.5%). |
 
 ### Generalization Gap
-*   **Train Loss**: ~0.42
-*   **Val Loss**: ~0.45
-*   **Gap**: ~0.03
-*   **Conclusion**: The model is **not overfitting**. The dedicated validation set and Early Stopping (patience=40) are working effectively. The gap is consistent across folds, indicating robust hyperparameters.
+*   **Train Loss**: ~0.453 (mean where non-NaN)
+*   **Val Loss**: ~0.4615
+*   **Gap**: ~0.008 (tighter than previous runs)
+*   **Conclusion**: The model is **not overfitting**. The Masked Superset Architecture and early stopping work effectively across all 90 folds.
 
 ---
 
 ## 2. Current Fail Points & Limitations
 
-### A. Consolidation Weakness
-The drop to ~56% accuracy in consolidation periods (Folds 8-9) is the primary model weakness.
-*   **Cause**: When the market moves sideways, the "signal-to-noise" ratio of returns drops. A 1% difference between stocks might be noise rather than alpha.
-*   **Risk**: If transaction costs are high, a 56% win rate might purely cover costs without profit (churn).
+### A. NaN Training Loss in Crisis Regimes (Critical)
+Seven folds (1, 20, 21, 36, 37, 59, 60, 61) exhibit NaN training loss — all in high-volatility regimes (GFC and COVID). The model enters the corresponding validation windows under-trained, capping rank accuracy at ~52–55% in those folds.
+*   **Fix**: Reduce `gradient_clip_norm` from 1.0 → 0.5; add per-layer gradient norm monitoring. See `backtest_findings.md` § Phase 0.
 
-### B. Magnitude Calibration
-While stable, `SmoothL1Loss` on log-targets is a heuristic.
-*   **Issue**: It treats under-prediction and over-prediction symmetrically. In trading, missing a big move (under-prediction) is an opportunity cost, but over-betting on a false move (over-prediction) is a realized loss.
+### B. Confidence Head Overconfidence
+MC Dropout (10 passes, Fold 90) gives a mean confidence of 87.1% despite direction score std of 0.15 — the model is not calibrated.
+*   **Fix**: Apply Platt Scaling or Isotonic Regression to the confidence head outputs before using them for position sizing.
 
-### C. Execution & Costs (Not Modeled)
-The current backtest assumes varying position sizes based on magnitude but **does not model slippage or commissions**.
-*   **Risk**: A high-turnover strategy (rebalancing every day/week) with 58% accuracy could be net negative after fees.
+### C. Rank Stability Under Uncertainty
+Only 73.5% of stock rank orderings are stable across MC Dropout passes — ~26.5% flip between passes. Using raw single-pass ranks for portfolio construction amplifies this instability.
+*   **Fix**: Use median rank across 10 MC Dropout passes at inference time.
+
+### D. Execution & Costs (Not Modeled)
+The current backtest does not model slippage or commissions.
+*   **Risk**: A high-turnover daily rebalancing strategy at 57.5% accuracy could be net-negative after fees.
+*   **Fix**: Integrate a 5 bps/trade cost model (TCA) before evaluating live viability.
 
 ---
 
 ## 3. Future Roadmap
 
-### Phase 1: Robustness (Immediate)
-1.  **Regime-Weighted Training**: Implement a sample weighting scheme where losses during "high confidence" regimes count more.
-2.  **Transaction Cost Analysis (TCA)**: Integrate a simple cost model (e.g., 5bps per trade) into the backtest to see if the edge survives.
-3.  **Dynamic Margin**: Instead of fixed `margin=0.5`, make the margin a function of current market volatility (e.g., `margin = 0.5 * VIX_factor`).
+> See `backtest_findings.md` for the full prioritized next-steps breakdown.
 
-### Phase 2: Portfolio Construction (Short Term)
-1.  **Mean-Variance Optimizer**: Instead of raw predictions, feed `dir_logits` (Alpha) and `mag_preds` (Variance proxy) into a convex optimizer to generate weights.
-2.  **Risk Parity**: Use the graph's learned adjacency matrix to cluster correlated stocks and allocate risk equally across clusters, rather than stocks.
+### Phase 0: Deployment Blockers (Do First)
+1.  **Fix NaN gradient cascades** — clip `max_norm` to 0.5, add per-layer monitoring.
+2.  **Calibrate confidence head** — Platt Scaling on held-out fold predictions.
+3.  **Validate long-short returns** — quintile return spread as live P&L proxy.
 
-### Phase 3: Alpha Expansion (Long Term)
-1.  **Alternative Data**: Ingest Sentiment Data (News/Twitter) as a new node type in the heterogeneous graph.
-2.  **Higher Frequency**: Move from Daily to Hourly bars. The GNN architecture is time-agnostic and should scale.
-3.  **Reinforcement Learning**: Fine-tune the trained model using RL (PPO) to optimize directly for Sharpe Ratio rather than classification/regression loss.
+### Phase 1: Robustness (Short-Term)
+1.  **Dynamic early stopping patience** — increase patience in high-vol regimes.
+2.  **Adaptive magnitude weight λ** — `λ = 0.05 * (1 + α * σ_regime)`.
+3.  **Transaction Cost Analysis (TCA)** — 5 bps/trade cost model integration.
+4.  **MC Dropout ensemble ranking** — median rank across 10 passes for stability.
+
+### Phase 2: Portfolio Construction (Medium-Term)
+1.  **Mean-Variance Optimizer** — feed `dir_logits` + `mag_preds` into a convex optimizer.
+2.  **Risk Parity via graph clusters** — equal-risk allocation across learned stock clusters.
+3.  **Regime-conditional training** — HMM/VIX tagger with regime-specific hyperparameters.
+
+### Phase 3: Alpha Expansion (Long-Term)
+1.  **Alternative data** — news/sentiment as new heterogeneous graph node type.
+2.  **Conformalized prediction intervals** — replace confidence head with distribution-free coverage.
+3.  **RL fine-tuning (PPO)** — optimize directly for Sharpe Ratio post-supervised-pretraining.

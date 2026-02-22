@@ -1,15 +1,18 @@
 # Backtesting & Metrics
+*Last updated: 2026-02-22 — reflects 90-fold walk-forward run (2007–2026)*
 
 ## 1. Walk-Forward Validation
 
 DGRCL uses **Walk-Forward Validation** (also known as Rolling Window Backtesting) to simulate how the model would have performed in real-time. This prevents look-ahead bias and tests the model's adaptability to changing market regimes.
 
-### Fold Strategy
-- **Window Size**: 300 days total per fold
-  - **Train**: First 200 days
-  - **Validation**: Next 100 days (Out-of-Sample)
-- **Step Size**: 50 days (advances the window forward)
-- **Overlap**: Each fold shares 250 days with the next fold (200 train + 50 overlap). This ensures dense coverage.
+### Fold Strategy (v1.5 — 90-Fold Configuration)
+- **Lookback Window**: 60 days (feature construction)
+- **Forecast Horizon**: 5 days
+- **Step Size**: 1 day (dense, maximally overlapping folds)
+- **Snapshots per fold**: 136 training snapshots, 36 validation snapshots
+- **Total Folds**: 90 (covering 4,799 trading days: 2007-01-25 → 2026-02-20)
+- **Universe**: Top 150 stocks by avg absolute returns + 4 macro factors
+- **Active stocks per timestep**: min=137, mean=144, max=150 (dynamic via Masked Superset)
 
 ## 2. Metrics
 
@@ -17,7 +20,7 @@ DGRCL uses **Walk-Forward Validation** (also known as Rolling Window Backtesting
 Measures the percentage of correctly ranked pairs within the same sector.
 - **Random Baseline**: 50%
 - **Edge**: >52% consistently is considered alpha.
-- **Goal**: >55% (DGRCL achieves ~58-60% in most regimes).
+- **Goal**: >55% (DGRCL achieves a **mean of 57.5%**, peak 61.0%, over the 90-fold run).
 
 $$ \text{Rank Acc} = \frac{\text{Correct Pairs}}{\text{Total Valid Pairs}} $$
 
