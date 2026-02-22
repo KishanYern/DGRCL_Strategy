@@ -9,6 +9,7 @@ Implements:
 - Mixed Precision Training (FP16) for GPU memory efficiency
 """
 
+import math
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -64,6 +65,16 @@ class EarlyStopping:
         Returns:
             True if training should stop
         """
+        # FIX #NaN-2: NaN val_loss must NEVER be accepted as a 'best' checkpoint.
+        # Prior behaviour: on first call when best_loss is None, NaN was stored as best_loss.
+        # Then nan < nan-delta is always False, so counter hit patience and restore_best()
+        # loaded the NaN-weight checkpoint, guaranteeing corrupt weights for the whole fold.
+        if math.isnan(val_loss):
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+            return self.early_stop
+
         if self.best_loss is None:
             self.best_loss = val_loss
             self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -85,6 +96,9 @@ class EarlyStopping:
     def restore_best(self, model: nn.Module):
         """Restore model to best checkpoint (mapped to model's current device)."""
         if self.best_state is not None:
+            # FIX #NaN-2: Don't restore a checkpoint whose recorded best_loss is NaN.
+            if self.best_loss is not None and math.isnan(self.best_loss):
+                return
             device = next(model.parameters()).device
             state = {k: v.to(device) for k, v in self.best_state.items()}
             model.load_state_dict(state)
@@ -96,7 +110,10 @@ class EarlyStopping:
 
 # Ranking loss hyperparameters
 RANKING_MARGIN = 0.5        # Logit separation required between winner/loser
-SIGNIFICANCE_THRESHOLD = 0.01  # 1% return divergence to qualify as valid pair
+SIGNIFICANCE_THRESHOLD = 0.003  # 0.3% return divergence to qualify as valid pair
+# FIX #NoLearn-3: Lowered from 1% → 0.3% to produce ~3× more valid pairs per snapshot.
+# 1% was too restrictive in calm market regimes, causing most snapshots to emit
+# zero valid pairs → zero loss → zero gradients → model stuck at random init.
 
 
 def compute_pairwise_ranking_loss(
@@ -151,7 +168,12 @@ def compute_pairwise_ranking_loss(
         # Pairwise ranking accuracy: % of valid pairs where score_i > score_j
         rank_acc = (score_diff[valid_pairs] > 0).float().mean().item()
     else:
-        loss = torch.tensor(0.0, device=scores.device, requires_grad=True)
+        # FIX #NoLearn-2: Use scores.sum() * 0.0 instead of torch.tensor(0.0, requires_grad=True).
+        # The leaf-tensor fallback has requires_grad=True but NO connection to the model's
+        # computation graph, so loss.backward() produces zero gradients for ALL parameters.
+        # scores.sum() * 0.0 IS connected to the graph (scores flows from the model forward
+        # pass), so gradients still propagate correctly even when loss value is 0.
+        loss = scores.sum() * 0.0
         rank_acc = 0.0
     
     return loss, rank_acc
@@ -196,13 +218,15 @@ def train_step(
     returns: torch.Tensor,  # [N_s] future returns (labels)
     optimizer: torch.optim.Optimizer,
     mse_loss_fn: nn.Module,
-    mag_weight: float = 0.1,
+    mag_weight: float = 0.05,
     macro_stock_edges: Optional[torch.Tensor] = None,
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None,
     active_mask: Optional[torch.Tensor] = None,
     max_grad_norm: float = 1.0,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    accumulation_steps: int = 4,
+    batch_idx: int = 0
 ) -> Dict[str, float]:
     """
     Single training step with Pairwise Ranking + Magnitude regression.
@@ -231,7 +255,10 @@ def train_step(
         Dict with loss metrics and task-specific metrics
     """
     model.train()
-    optimizer.zero_grad()
+    
+    # Gradient Accumulation: Only zero gradients at the start of an accumulation cycle
+    if batch_idx % accumulation_steps == 0:
+        optimizer.zero_grad()
     
     # --------------- Forward Pass ---------------
     use_amp = scaler is not None
@@ -268,6 +295,28 @@ def train_step(
 
         loss_total = loss_dir + mag_weight * loss_mag
 
+    # FIX #NaN-3: Skip the entire backward pass if loss is non-finite.
+    # A single degenerate snapshot (all-zero future returns, pure-padding window,
+    # or FP16 overflow on a high-volatility window) can produce NaN/Inf that would
+    # corrupt all model weights. Silently skip and return NaN metrics so callers
+    # can detect the bad batch without crashing the rest of the epoch.
+    if not torch.isfinite(loss_total):
+        # Still zero_grad to keep accumulation state clean
+        if (batch_idx + 1) % accumulation_steps == 0:
+            optimizer.zero_grad()
+        return {
+            'loss': float('nan'),
+            'loss_dir': loss_dir.item() if torch.isfinite(loss_dir) else float('nan'),
+            'loss_mag': loss_mag.item() if torch.isfinite(loss_mag) else float('nan'),
+            'rank_accuracy': 0.0,
+            'mag_mae': float('nan'),
+            'grad_norm': 0.0
+        }
+
+    # Scale the loss since gradients are accumulated
+    loss_item = loss_total.item()
+    loss_total = loss_total / accumulation_steps
+
     # --------------- Backward Pass ---------------
     # FIX #2: Removed duplicate optimizer.zero_grad() that was here.
     # The first zero_grad() at the top of the function is sufficient.
@@ -276,14 +325,20 @@ def train_step(
     
     if use_amp:
         scaler.scale(loss_total).backward()
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        scaler.step(optimizer)
-        scaler.update()
+        if (batch_idx + 1) % accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            grad_norm = torch.tensor(0.0)
     else:
         loss_total.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        optimizer.step()
+        if (batch_idx + 1) % accumulation_steps == 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+        else:
+            grad_norm = torch.tensor(0.0)
     
     # --- Metrics ---
     with torch.no_grad():
@@ -295,7 +350,7 @@ def train_step(
             mag_mae = torch.abs(mag_preds.squeeze(-1) - mag_target).mean().item()
     
     return {
-        'loss': loss_total.item(),
+        'loss': loss_item,
         'loss_dir': loss_dir.item(),
         'loss_mag': loss_mag.item(),
         'rank_accuracy': rank_accuracy,
@@ -310,11 +365,12 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     mse_loss_fn: nn.Module,
     device: torch.device,
-    mag_weight: float = 0.1,
+    mag_weight: float = 0.05,
     max_grad_norm: float = 1.0,
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    accumulation_steps: int = 4
 ) -> Dict[str, float]:
     """
     Train for one epoch over sequential snapshots.
@@ -372,7 +428,9 @@ def train_epoch(
             sector_mask=sector_mask,
             sector_ids=sector_ids,
             active_mask=active_mask,
-            scaler=scaler
+            scaler=scaler,
+            accumulation_steps=accumulation_steps,
+            batch_idx=num_batches
         )
         
         for key in epoch_metrics:
@@ -393,7 +451,7 @@ def evaluate(
     data_loader: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     mse_loss_fn: nn.Module,
     device: torch.device,
-    mag_weight: float = 0.1,
+    mag_weight: float = 0.05,
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None
 ) -> Dict[str, float]:
@@ -652,7 +710,11 @@ def save_attention_heatmap(
             active_mask = active_mask.to(device)
             stock_h = stock_h * active_mask.unsqueeze(-1).float()
 
-        stock_h = model.embedding_norm(stock_h)  # LayerNorm
+        stock_h = model.stock_embedding_norm(stock_h)  # LayerNorm
+        
+        # LayerNorm bias re-introduces non-zero values for inactive nodes
+        if active_mask is not None:
+            stock_h = stock_h * active_mask.unsqueeze(-1).float()
 
         # Ensure sector_mask is on the correct device
         if sector_mask is not None:
@@ -879,7 +941,7 @@ def main(
     use_real_data: bool = False,
     start_fold: int = 1,
     end_fold: Optional[int] = None,
-    mag_weight: float = 0.1,
+    mag_weight: float = 0.05,
     force_cpu: bool = False,
     use_amp: bool = True,
     ablation: str = "baseline",
@@ -913,9 +975,13 @@ def main(
     HIDDEN_DIM = 64
     WINDOW_SIZE = 60
     NUM_EPOCHS = epochs
-    LR = 1e-4
+    LR = 5e-5
     WEIGHT_DECAY = 1e-3
-    PATIENCE = 40  # Early stopping patience — allow more exploration
+    PATIENCE = 10  # FIX #NoLearn-1: Reduced from 40 → 10.
+    # With patience=40 and LR=5e-5 the model was effectively never improving:
+    # every fold early-stopped at epoch 41, meaning the best checkpoint was always
+    # epoch 1 (random init). A shorter patience reacts faster to plateaus and
+    # frees compute for folds that actually show improvement.
     MAX_STOCKS = 150  # Stock universe size
     
     # Walk-forward parameters (only used with real data)
@@ -1073,6 +1139,24 @@ def main(
             torch.cuda.synchronize()  # Wait for all kernels to finish
             torch.cuda.empty_cache()  # Release cached memory
         gc.collect()  # Python garbage collection
+
+        # FIX #NaN-1 (PRIMARY): Recreate the GradScaler at the start of every fold.
+        #
+        # The GradScaler tracks inf/NaN gradient events via internal state
+        # (_scale, _growth_tracker, _found_inf_per_device). When a bad snapshot
+        # in Fold N triggers a NaN, the scaler lowers its scale factor. This
+        # degraded state carries over into Fold N+1, N+2, … even though the model
+        # is freshly re-initialised each fold.
+        #
+        # In this backtest: Fold 1 already showed NaN training loss (line 143 of
+        # the log). The scaler kept degrading until Fold 19, where the scale hit
+        # a floor that caused FP16 overflow on the *very first* forward pass,
+        # producing NaN in *every* subsequent fold.
+        #
+        # Recreating the scaler gives each fold a fresh scale = 2^16 and a clean
+        # inf-tracking state, decoupling folds from each other.
+        if use_amp and device.type == 'cuda':
+            scaler = torch.cuda.amp.GradScaler()
         
         print(f"\n{'='*60}")
         print(f"FOLD {fold_idx + 1}/{len(folds)}")
@@ -1290,8 +1374,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mag-weight",
         type=float,
-        default=0.1,
-        help="Weight λ for magnitude loss (default: 1.0)"
+        default=0.05,
+        help="Weight λ for magnitude loss (default: 0.05)"
     )
     
     parser.add_argument(

@@ -1096,7 +1096,8 @@ class TestTrainingStepWithActiveMask:
             optimizer=optimizer,
             mse_loss_fn=mse_loss_fn,
             mag_weight=1.0,
-            active_mask=active_mask
+            active_mask=active_mask,
+            accumulation_steps=1
         )
 
         # At least some parameters must have changed — if double zero_grad() was
