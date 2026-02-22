@@ -129,8 +129,8 @@ class HeteroGraphBuilder:
             src = torch.arange(num_macro).repeat_interleave(num_stock)
             dst = torch.arange(num_stock).repeat(num_macro)
             return torch.stack([src, dst], dim=0)
-        
-        return torch.cat(edges_list, dim=1) if edges_list else None
+
+        return torch.cat(edges_list, dim=1)
 
 
 # =============================================================================
@@ -225,6 +225,7 @@ class DynamicGraphLearner(nn.Module):
         self,
         embeddings: torch.Tensor,  # [N, H]
         sector_mask: Optional[torch.Tensor] = None, # [N, N] bool
+        active_mask: Optional[torch.Tensor] = None,  # [N] bool
         return_weights: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -253,24 +254,35 @@ class DynamicGraphLearner(nn.Module):
         attention = F.leaky_relu(torch.matmul(concat, self.a), negative_slope=0.2)  # [N, N]
         attention = attention / self.temperature
         
-        # --- APPLY SECTOR MASK ---
+        # --- COMBINE SECTOR MASK + ACTIVE MASK ---
+        # Build combined mask: both nodes must be active AND in same sector
+        combined_mask = None
+        if active_mask is not None:
+            # Pairwise active mask: both src and dst must be active
+            active_pairs = active_mask.unsqueeze(0) & active_mask.unsqueeze(1)  # [N, N]
+            combined_mask = active_pairs
+        
         if sector_mask is not None:
-            # Expand mask to attention shape if needed (though [N,N] should match)
             if sector_mask.shape != attention.shape:
                raise ValueError(f"Sector mask shape {sector_mask.shape} mismatch with attention {attention.shape}")
-            
-            # Mask out cross-sector pairs with large negative value.
-            # Use dtype-aware min to avoid FP16 overflow (-1e9 > Half max ~65504).
-            mask_value = torch.finfo(attention.dtype).min / 2
-            attention = attention.masked_fill(~sector_mask, mask_value)
+            if combined_mask is not None:
+                combined_mask = combined_mask & sector_mask
+            else:
+                combined_mask = sector_mask
+        
+        if combined_mask is not None:
+            # Mask out invalid pairs with -inf.
+            # float('-inf') is safe for all dtypes (FP16/FP32/BF16) and
+            # guarantees isfinite() cleanly separates valid from masked edges.
+            attention = attention.masked_fill(~combined_mask, float('-inf'))
 
         # Top-k selection per row (each node keeps top-k neighbors)
         k = min(self.top_k, N - 1)
         topk_values, topk_indices = torch.topk(attention, k=k, dim=1)  # [N, k]
         
-        # Filter out masked edges (values near dtype min)
-        # This handles the case where k > sector_size
-        valid_mask = topk_values > (torch.finfo(topk_values.dtype).min / 4)  # [N, k]
+        # Filter out masked edges (those filled with -inf above).
+        # isfinite() is dtype-agnostic and correctly identifies -inf in FP16/FP32/BF16.
+        valid_mask = torch.isfinite(topk_values)  # [N, k]
         
         # Build sparse edge_index
         # CRITICAL: In PyG MessagePassing, info flows src → dst
@@ -427,6 +439,8 @@ class MacroPropagation(MessagePassing):
         
         # Normalize via softmax over incoming edges
         alpha = softmax(alpha, dst, num_nodes=h.size(0))  # [E, H]
+        # NaN-safe: fully inactive nodes have all-(-inf) inputs → NaN after softmax
+        alpha = torch.nan_to_num(alpha, nan=0.0)
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
         
         # Incorporate precomputed edge weights if available
@@ -588,8 +602,13 @@ class MacroDGRCL(nn.Module):
             dropout=dropout
         )
 
-        # Embedding Normalization
-        self.embedding_norm = nn.LayerNorm(hidden_dim)
+        # Embedding Normalization — separate norms for stocks and macros.
+        # Stocks and macros come from different domains (equity prices vs. macro
+        # indicators) with different latent-space statistics. A single shared
+        # LayerNorm would force one set of learned scale/bias to serve both,
+        # which conflates gradients from fundamentally different distributions.
+        self.stock_embedding_norm = nn.LayerNorm(hidden_dim)
+        self.macro_embedding_norm = nn.LayerNorm(hidden_dim)
         
         # Dynamic Graph Learner
         self.graph_learner = DynamicGraphLearner(
@@ -628,7 +647,8 @@ class MacroDGRCL(nn.Module):
         stock_features: torch.Tensor,  # [N_s, T, d_s]
         macro_features: torch.Tensor,  # [N_m, T, d_m]
         macro_stock_edges: Optional[torch.Tensor] = None,  # [2, E_ms]
-        sector_mask: Optional[torch.Tensor] = None # [N_s, N_s] boolean mask
+        sector_mask: Optional[torch.Tensor] = None, # [N_s, N_s] boolean mask
+        active_mask: Optional[torch.Tensor] = None  # [N_s] boolean mask
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through GNN backbone and Multi-Task head.
@@ -647,15 +667,22 @@ class MacroDGRCL(nn.Module):
         stock_h = self.stock_encoder(stock_features)  # [N_s, H]
         macro_h = self.macro_encoder(macro_features)  # [N_m, H]
 
-        # Normalize embeddings
-        stock_h = self.embedding_norm(stock_h)
-        macro_h = self.embedding_norm(macro_h)
+        # SAFEGUARD 1: Zero out inactive embeddings BEFORE LayerNorm
+        # LSTM produces non-zero outputs even for zero inputs (due to bias).
+        # These meaningless vectors would skew LayerNorm batch statistics.
+        if active_mask is not None:
+            stock_h = stock_h * active_mask.unsqueeze(-1).float()  # [N_s, H]
+
+        # Normalize embeddings (separate norms per domain — see __init__)
+        stock_h = self.stock_embedding_norm(stock_h)
+        macro_h = self.macro_embedding_norm(macro_h)
         
         # 2. Dynamic Graph Learning (Stock→Stock)
-        # Pass sector_mask ensuring stocks only attend to peers
+        # SAFEGUARD 2: Pass active_mask to sever inactive nodes via -inf masking
         stock_stock_edges, edge_weights = self.graph_learner(
             stock_h, 
             sector_mask=sector_mask,
+            active_mask=active_mask,
             return_weights=True
         )
         
@@ -666,6 +693,12 @@ class MacroDGRCL(nn.Module):
             src = torch.arange(N_m, device=stock_features.device).repeat_interleave(N_s)
             dst = torch.arange(N_s, device=stock_features.device).repeat(N_m)
             macro_stock_edges = torch.stack([src, dst], dim=0)
+        
+        # SAFEGUARD 3: Filter macro→stock edges to active destinations only
+        # Prevents macro embeddings from broadcasting into zero-padded inactive nodes
+        if active_mask is not None:
+            dst_active = active_mask[macro_stock_edges[1]]  # [E] bool
+            macro_stock_edges = macro_stock_edges[:, dst_active]
         
         # 4. Message Passing
         h = stock_h
@@ -679,6 +712,13 @@ class MacroDGRCL(nn.Module):
             )
             # Residual connection + LayerNorm
             h = ln(h + h_new)
+            # SAFEGUARD 4: Re-zero inactive nodes after each residual+LayerNorm.
+            # LayerNorm's learned bias can re-introduce non-zero values for
+            # nodes that were zeroed by Safeguard 1. Without re-zeroing here,
+            # those spurious embeddings propagate into subsequent MP layers
+            # via the residual path, contaminating active-stock aggregation.
+            if active_mask is not None:
+                h = h * active_mask.unsqueeze(-1).float()
         
         # 5. Multi-Task Head
         direction_logits, magnitude_preds = self.output_head(h)

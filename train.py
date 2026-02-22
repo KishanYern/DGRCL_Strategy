@@ -103,6 +103,7 @@ def compute_pairwise_ranking_loss(
     scores: torch.Tensor,        # [N_s] model output logits
     returns: torch.Tensor,       # [N_s] actual returns
     sector_mask: Optional[torch.Tensor] = None,  # [N_s, N_s] bool
+    active_mask: Optional[torch.Tensor] = None,   # [N_s] bool
     margin: float = RANKING_MARGIN,
     threshold: float = SIGNIFICANCE_THRESHOLD
 ) -> Tuple[torch.Tensor, float]:
@@ -137,6 +138,11 @@ def compute_pairwise_ranking_loss(
     if sector_mask is not None:
         valid_pairs = valid_pairs & sector_mask
     
+    # 3b. Filter to active-active pairs only (both stocks must be tradable)
+    if active_mask is not None:
+        active_pairs = active_mask.unsqueeze(1) & active_mask.unsqueeze(0)  # [N, N]
+        valid_pairs = valid_pairs & active_pairs
+    
     # 4. Compute margin ranking loss: max(0, margin - score_diff)
     ranking_loss_matrix = torch.relu(margin - score_diff)
     
@@ -151,22 +157,35 @@ def compute_pairwise_ranking_loss(
     return loss, rank_acc
 
 
-def compute_log_scaled_mag_target(returns: torch.Tensor) -> torch.Tensor:
+def compute_log_scaled_mag_target(
+    returns: torch.Tensor,
+    active_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Log-scale magnitude targets: log(1 + |returns| / σ).
-    
+
     Normalizes raw absolute returns (~0.001–0.02 range) into a
     well-behaved ~[0, 3] range so SmoothL1Loss can produce meaningful
     gradients instead of behaving as pure MSE.
-    
+
+    FIX #5: σ is computed only over ACTIVE stocks. Zero-padded inactive
+    stocks have returns==0 after union-index reindexing; including them
+    deflates σ and inflates the normalized targets for active stocks,
+    causing the magnitude head to see artificially large targets.
+
     Args:
         returns: [N_s] raw future returns
-        
+        active_mask: [N_s] bool — if provided, sigma is computed over
+                     active stocks only; all N_s targets are still returned.
+
     Returns:
         [N_s] log-scaled magnitude targets
     """
     abs_ret = torch.abs(returns)
-    sigma = abs_ret.std().clamp(min=1e-6)
+    if active_mask is not None and active_mask.any():
+        sigma = abs_ret[active_mask].std().clamp(min=1e-6)
+    else:
+        sigma = abs_ret.std().clamp(min=1e-6)
     return torch.log1p(abs_ret / sigma)
 
 
@@ -181,6 +200,7 @@ def train_step(
     macro_stock_edges: Optional[torch.Tensor] = None,
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None,
+    active_mask: Optional[torch.Tensor] = None,
     max_grad_norm: float = 1.0,
     scaler: Optional[torch.cuda.amp.GradScaler] = None
 ) -> Dict[str, float]:
@@ -220,7 +240,8 @@ def train_step(
             stock_features=stock_features,
             macro_features=macro_features,
             macro_stock_edges=macro_stock_edges,
-            sector_mask=sector_mask
+            sector_mask=sector_mask,
+            active_mask=active_mask
         )
         
         scores = dir_logits.squeeze(-1)  # [N_s]
@@ -229,17 +250,29 @@ def train_step(
         loss_dir, rank_accuracy = compute_pairwise_ranking_loss(
             scores=scores,
             returns=returns,
-            sector_mask=sector_mask
+            sector_mask=sector_mask,
+            active_mask=active_mask
         )
         
         # --------------- Magnitude: SmoothL1 on log-scaled targets ---------------
-        mag_target = compute_log_scaled_mag_target(returns)
-        loss_mag = mse_loss_fn(mag_preds.squeeze(-1), mag_target)
-        
+        # FIX #5: pass active_mask so sigma is computed over active stocks only
+        mag_target = compute_log_scaled_mag_target(returns, active_mask=active_mask)
+        # Mask magnitude loss: only compute over active stocks
+        if active_mask is not None and active_mask.any():
+            loss_mag = mse_loss_fn(
+                mag_preds.squeeze(-1)[active_mask],
+                mag_target[active_mask]
+            )
+        else:
+            loss_mag = mse_loss_fn(mag_preds.squeeze(-1), mag_target)
+
         loss_total = loss_dir + mag_weight * loss_mag
-    
+
     # --------------- Backward Pass ---------------
-    optimizer.zero_grad()
+    # FIX #2: Removed duplicate optimizer.zero_grad() that was here.
+    # The first zero_grad() at the top of the function is sufficient.
+    # A second call here wiped all gradients computed in the autocast block,
+    # silently preventing the model from learning.
     
     if use_amp:
         scaler.scale(loss_total).backward()
@@ -254,7 +287,12 @@ def train_step(
     
     # --- Metrics ---
     with torch.no_grad():
-        mag_mae = torch.abs(mag_preds.squeeze(-1) - mag_target).mean().item()
+        if active_mask is not None and active_mask.any():
+            mag_mae = torch.abs(
+                mag_preds.squeeze(-1)[active_mask] - mag_target[active_mask]
+            ).mean().item()
+        else:
+            mag_mae = torch.abs(mag_preds.squeeze(-1) - mag_target).mean().item()
     
     return {
         'loss': loss_total.item(),
@@ -268,7 +306,7 @@ def train_step(
 
 def train_epoch(
     model: MacroDGRCL,
-    data_loader: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    data_loader: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     optimizer: torch.optim.Optimizer,
     mse_loss_fn: nn.Module,
     device: torch.device,
@@ -309,7 +347,15 @@ def train_epoch(
     if sector_ids is not None:
         sector_ids = sector_ids.to(device)
     
-    for stock_feat, macro_feat, returns in data_loader:
+    for snapshot in data_loader:
+        # Support both 3-tuple (legacy) and 4-tuple (with active_mask) formats
+        if len(snapshot) == 4:
+            stock_feat, macro_feat, returns, active_mask = snapshot
+            active_mask = active_mask.to(device)
+        else:
+            stock_feat, macro_feat, returns = snapshot
+            active_mask = None
+        
         stock_feat = stock_feat.to(device)
         macro_feat = macro_feat.to(device)
         returns = returns.to(device)
@@ -325,6 +371,7 @@ def train_epoch(
             max_grad_norm=max_grad_norm,
             sector_mask=sector_mask,
             sector_ids=sector_ids,
+            active_mask=active_mask,
             scaler=scaler
         )
         
@@ -343,7 +390,7 @@ def train_epoch(
 @torch.no_grad()
 def evaluate(
     model: MacroDGRCL,
-    data_loader: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    data_loader: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     mse_loss_fn: nn.Module,
     device: torch.device,
     mag_weight: float = 0.1,
@@ -352,18 +399,6 @@ def evaluate(
 ) -> Dict[str, float]:
     """
     Evaluate model on validation data with pairwise ranking + magnitude metrics.
-    
-    Args:
-        model: MacroDGRCL model
-        data_loader: Validation data
-        mse_loss_fn: SmoothL1Loss for magnitude
-        device: Torch device
-        mag_weight: λ for magnitude loss
-        sector_mask: [N_s, N_s] boolean mask
-        sector_ids: [N_s] sector IDs (unused, kept for API compat)
-        
-    Returns:
-        Dict with evaluation metrics
     """
     model.eval()
     eval_metrics = {
@@ -375,7 +410,15 @@ def evaluate(
     if sector_mask is not None:
         sector_mask = sector_mask.to(device)
     
-    for stock_feat, macro_feat, returns in data_loader:
+    for snapshot in data_loader:
+        # Support both 3-tuple (legacy) and 4-tuple (with active_mask) formats
+        if len(snapshot) == 4:
+            stock_feat, macro_feat, returns, active_mask = snapshot
+            active_mask = active_mask.to(device)
+        else:
+            stock_feat, macro_feat, returns = snapshot
+            active_mask = None
+        
         stock_feat = stock_feat.to(device)
         macro_feat = macro_feat.to(device)
         returns = returns.to(device)
@@ -385,7 +428,8 @@ def evaluate(
             dir_logits, mag_preds = model(
                 stock_features=stock_feat,
                 macro_features=macro_feat,
-                sector_mask=sector_mask
+                sector_mask=sector_mask,
+                active_mask=active_mask
             )
         
         scores = dir_logits.squeeze(-1)
@@ -394,15 +438,26 @@ def evaluate(
         loss_dir, rank_accuracy = compute_pairwise_ranking_loss(
             scores=scores,
             returns=returns,
-            sector_mask=sector_mask
+            sector_mask=sector_mask,
+            active_mask=active_mask
         )
         
-        # Magnitude: SmoothL1 on log-scaled targets
-        mag_target = compute_log_scaled_mag_target(returns)
-        loss_mag = mse_loss_fn(mag_preds.squeeze(-1), mag_target)
-        loss_total = loss_dir + mag_weight * loss_mag
+        # Magnitude: SmoothL1 on log-scaled targets (masked)
+        # FIX #5: pass active_mask so sigma is computed over active stocks only
+        mag_target = compute_log_scaled_mag_target(returns, active_mask=active_mask)
+        if active_mask is not None and active_mask.any():
+            loss_mag = mse_loss_fn(
+                mag_preds.squeeze(-1)[active_mask],
+                mag_target[active_mask]
+            )
+            mag_mae = torch.abs(
+                mag_preds.squeeze(-1)[active_mask] - mag_target[active_mask]
+            ).mean().item()
+        else:
+            loss_mag = mse_loss_fn(mag_preds.squeeze(-1), mag_target)
+            mag_mae = torch.abs(mag_preds.squeeze(-1) - mag_target).mean().item()
         
-        mag_mae = torch.abs(mag_preds.squeeze(-1) - mag_target).mean().item()
+        loss_total = loss_dir + mag_weight * loss_mag
         
         eval_metrics['loss'] += loss_total.item()
         eval_metrics['loss_dir'] += loss_dir.item()
@@ -423,34 +478,41 @@ def create_sequential_snapshots(
     returns_data: torch.Tensor,  # [N_s, Total_T]
     window_size: int = 60,
     step_size: int = 1,
-    forecast_horizon: int = 5
-) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    forecast_horizon: int = 5,
+    inclusion_mask: Optional[torch.Tensor] = None  # [N_s, Total_T]
+) -> List[Tuple]:
     """
     Create sequential snapshot batches from time-series data.
     
-    Args:
-        stock_data: [N_s, Total_T, d_s] full stock time-series
-        macro_data: [N_m, Total_T, d_m] full macro time-series
-        returns_data: [N_s, Total_T] stock returns
-        window_size: Lookback window T
-        step_size: Stride between windows
-        forecast_horizon: Days ahead for return labels
-        
     Returns:
-        List of (stock_window, macro_window, future_returns) tuples
+        If inclusion_mask is provided:
+            List of (stock_window, macro_window, future_returns, active_mask) 4-tuples
+        Otherwise:
+            List of (stock_window, macro_window, future_returns) 3-tuples (legacy)
     """
     total_t = stock_data.size(1)
     snapshots = []
     
-    for t in range(0, total_t - window_size - forecast_horizon, step_size):
-        # Extract windows
-        stock_window = stock_data[:, t:t+window_size, :]  # [N_s, T, d_s]
-        macro_window = macro_data[:, t:t+window_size, :]  # [N_m, T, d_m]
+    for t in range(0, total_t - window_size - forecast_horizon + 1, step_size):
+        stock_window = stock_data[:, t:t+window_size, :]
+        macro_window = macro_data[:, t:t+window_size, :]
         
-        # Future returns as labels (cumulative over forecast horizon)
+        # Future returns as labels.
+        # INVARIANT: future_returns uses indices [t+window_size, t+window_size+forecast_horizon)
+        # which are strictly AFTER the lookback window [t, t+window_size).
+        # stock_window[:, :, -1] (the Returns column) only reaches t+window_size-1 — no leakage.
         future_returns = returns_data[:, t+window_size:t+window_size+forecast_horizon].sum(dim=1)
         
-        snapshots.append((stock_window, macro_window, future_returns))
+        if inclusion_mask is not None:
+            # FIX #1 (same as _create_snapshots in data_loader.py):
+            # Use t+window_size (forecast START) not t+window_size-1 (last lookback day).
+            # This correctly identifies which stocks are tradable when the
+            # forecast period begins, matching the semantics of future_returns.
+            clamp_t = min(t + window_size, inclusion_mask.size(1) - 1)
+            active_mask = inclusion_mask[:, clamp_t]  # [N_s]
+            snapshots.append((stock_window, macro_window, future_returns, active_mask))
+        else:
+            snapshots.append((stock_window, macro_window, future_returns))
     
     return snapshots
 
@@ -553,14 +615,15 @@ def save_attention_heatmap(
     output_dir: str,
     tickers: Optional[List[str]] = None,
     max_display: int = 30,
-    sector_mask: Optional[torch.Tensor] = None
+    sector_mask: Optional[torch.Tensor] = None,
+    active_mask: Optional[torch.Tensor] = None,   # FIX #4: added parameter
 ):
     """
     Visualize the DynamicGraphLearner attention weights as a heatmap.
-    
+
     Shows which stocks attend to which other stocks, revealing whether
     the learned edges capture meaningful relationships or memorize noise.
-    
+
     Args:
         model: Trained MacroDGRCL model
         stock_features: [N_s, T, d_s] input features
@@ -570,22 +633,38 @@ def save_attention_heatmap(
         tickers: Optional list of ticker names for axis labels
         max_display: Maximum number of stocks to show (for readability)
         sector_mask: [N_s, N_s] boolean sector mask (same as used in training)
+        active_mask: [N_s] bool — inactive nodes are zeroed before LayerNorm
+                     to match the Safeguard 1 applied in MacroDGRCL.forward()
     """
     model.eval()
     os.makedirs(output_dir, exist_ok=True)
-    
+
     with torch.no_grad():
-        # Match model's actual forward path: encode → normalize → graph_learner
+        # Replicate MacroDGRCL.forward() exactly:
+        # encode → Safeguard 1 (zero inactive) → normalize → graph_learner
         stock_h = model.stock_encoder(stock_features)  # [N_s, H]
-        stock_h = model.embedding_norm(stock_h)         # LayerNorm (was missing!)
-        
-        # Ensure sector_mask is on the same device as the model
+
+        # FIX #4: Apply Safeguard 1 before LayerNorm (same as forward pass).
+        # Without this, LSTM bias on inactive stocks skews LayerNorm stats
+        # AND the graph learner receives non-zero embeddings for dummy nodes.
+        if active_mask is not None:
+            device = stock_features.device
+            active_mask = active_mask.to(device)
+            stock_h = stock_h * active_mask.unsqueeze(-1).float()
+
+        stock_h = model.embedding_norm(stock_h)  # LayerNorm
+
+        # Ensure sector_mask is on the correct device
         if sector_mask is not None:
             sector_mask = sector_mask.to(stock_features.device)
-        
-        # Pass sector_mask so cross-sector pairs are masked (was missing!)
+
+        # FIX #4: Pass active_mask so inactive→* and *→inactive edges
+        # receive -inf attention, keeping the heatmap accurate.
         edge_index, edge_weights = model.graph_learner(
-            stock_h, sector_mask=sector_mask, return_weights=True
+            stock_h,
+            sector_mask=sector_mask,
+            active_mask=active_mask,
+            return_weights=True,
         )
     
     N_s = stock_features.size(0)
@@ -776,27 +855,23 @@ ABLATION_CONFIGS = {
 
 
 def slice_stock_features(
-    snapshots: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    snapshots: List[Tuple],
     feature_indices: List[int]
-) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> List[Tuple]:
     """
     Slice stock features to keep only selected dimensions.
-    
-    Args:
-        snapshots: List of (stock, macro, returns) tuples
-        feature_indices: List of indices to keep (e.g. [0, 1, 7])
-        
-    Returns:
-        List of new tuples with sliced stock features
+    Supports both 3-tuple (stock, macro, returns) and 4-tuple 
+    (stock, macro, returns, active_mask) formats.
     """
     if not feature_indices:
         return snapshots
         
     sliced_snapshots = []
-    for stock, macro, ret in snapshots:
-        # stock is [N_s, T, d_s] -> slice last dim
+    for snapshot in snapshots:
+        stock = snapshot[0]
         stock_sliced = stock[:, :, feature_indices]
-        sliced_snapshots.append((stock_sliced, macro, ret))
+        # Preserve all other elements (macro, ret, and optional active_mask)
+        sliced_snapshots.append((stock_sliced,) + snapshot[1:])
         
     return sliced_snapshots
 
@@ -914,6 +989,20 @@ def main(
         else:
             sector_ids = None
             print("  No sector mapping found. Running in sector-agnostic mode.")
+
+        # Defensive alignment check: ensure sector tensors match the loaded universe.
+        # A mismatch here (e.g., if load_processed_data reorders tickers) would
+        # silently corrupt pairwise comparisons for every snapshot in every fold.
+        if sector_mask is not None:
+            assert sector_mask.shape[0] == len(tickers), (
+                f"sector_mask rows ({sector_mask.shape[0]}) ≠ len(tickers) ({len(tickers)}). "
+                "Ticker order in graph_builder must match stock_data."
+            )
+        if sector_ids is not None:
+            assert sector_ids.shape[0] == len(tickers), (
+                f"sector_ids length ({sector_ids.shape[0]}) ≠ len(tickers) ({len(tickers)}). "
+                "Ticker order in sector_to_id mapping must match stock_data."
+            )
             
     else:
         NUM_STOCKS = 50
@@ -925,11 +1014,15 @@ def main(
         macro_data = torch.randn(NUM_MACROS, total_timesteps, MACRO_DIM)
         returns_data = torch.randn(NUM_STOCKS, total_timesteps) * 0.02
         
+        # Create synthetic inclusion mask (~80% active at any time)
+        inclusion_mask = torch.rand(NUM_STOCKS, total_timesteps) > 0.2
+        
         train_data = create_sequential_snapshots(
             stock_data, macro_data, returns_data,
             window_size=WINDOW_SIZE,
             step_size=5,
-            forecast_horizon=5
+            forecast_horizon=5,
+            inclusion_mask=inclusion_mask
         )
         folds = [(train_data, [])]
         print(f"Created {len(train_data)} training snapshots (synthetic)")
@@ -954,7 +1047,13 @@ def main(
         except (json.JSONDecodeError, KeyError):
             print("Warning: corrupt checkpoint file, starting fresh")
     
-    for fold_idx, (train_data_fold, val_data_fold) in enumerate(folds):
+    for fold_idx, fold_tuple in enumerate(folds):
+        # Unpack 3-tuple: (train_snapshots, val_snapshots, WalkForwardFold metadata).
+        # The fold metadata carries accurate train_start / val_end indices from the
+        # WalkForwardSplitter, preventing the hardcoded synthetic-formula bug (Issue #7).
+        train_data_fold, val_data_fold = fold_tuple[0], fold_tuple[1]
+        fold_meta = fold_tuple[2] if len(fold_tuple) == 3 else None
+
         # Apply feature ablation (slices stock_features dim for each snapshot)
         train_data = slice_stock_features(train_data_fold, feature_indices)
         val_data = slice_stock_features(val_data_fold, feature_indices)
@@ -1085,8 +1184,10 @@ def main(
                 'val_loss': val_metrics['loss'],
                 'rank_accuracy': val_metrics['rank_accuracy'],
                 'mag_mae': val_metrics['mag_mae'],
-                'train_start_idx': fold_idx * FOLD_STEP,
-                'val_end_idx': fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
+                # Use actual splitter indices when available (real data 3-tuple folds);
+                # fall back to synthetic formula only if metadata is absent.
+                'train_start_idx': fold_meta.train_start if fold_meta is not None else fold_idx * FOLD_STEP,
+                'val_end_idx': fold_meta.val_end if fold_meta is not None else fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
             })
         else:
             all_fold_results.append({
@@ -1095,8 +1196,8 @@ def main(
                 'val_loss': None,
                 'rank_accuracy': epoch_metrics['rank_accuracy'],
                 'mag_mae': epoch_metrics['mag_mae'],
-                'train_start_idx': fold_idx * FOLD_STEP,
-                'val_end_idx': fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
+                'train_start_idx': fold_meta.train_start if fold_meta is not None else fold_idx * FOLD_STEP,
+                'val_end_idx': fold_meta.val_end if fold_meta is not None else fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
             })
         
         # Save checkpoint after each fold
