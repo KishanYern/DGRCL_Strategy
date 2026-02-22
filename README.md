@@ -45,9 +45,9 @@ graph TD
     G --> H["dir_head → Logits [N_s, 1]"]
     G --> I["mag_head → SmoothL1 [N_s, 1]"]
 
-    style G fill:#f9f,stroke:#333,stroke-width:2px
-    style H fill:#bbf,stroke:#333
-    style I fill:#bfb,stroke:#333
+    style G fill:#9370db,stroke:#333,stroke-width:2px,color:#fff
+    style H fill:#4169e1,stroke:#333,color:#fff
+    style I fill:#2e8b57,stroke:#333,color:#fff
 ```
 
 **Loss**: `L_total = MarginRankingLoss(dir) + λ · SmoothL1Loss(mag)`
