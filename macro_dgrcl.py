@@ -1,5 +1,5 @@
 """
-Macro-Aware DGRCL v1.4 - Sector-Aware Macro-Lag Architecture
+Macro-Aware DGRCL v1.5 - Sector-Aware Macro-Lag Architecture
 
 A Heterogeneous Graph Neural Network for market-neutral trading with:
 - Explicit Macro factor nodes (not feature vectors)
@@ -129,8 +129,8 @@ class HeteroGraphBuilder:
             src = torch.arange(num_macro).repeat_interleave(num_stock)
             dst = torch.arange(num_stock).repeat(num_macro)
             return torch.stack([src, dst], dim=0)
-
-        return torch.cat(edges_list, dim=1)
+        else:
+            return torch.cat(edges_list, dim=1)
 
 
 # =============================================================================
@@ -557,7 +557,7 @@ class MultiTaskHead(nn.Module):
 
 class MacroDGRCL(nn.Module):
     """
-    Macro-Aware Dynamic Graph Relation Contrastive Learning Model v1.4.
+    Macro-Aware Dynamic Graph Relation Contrastive Learning Model v1.5.
     
     Multi-Task Learning Architecture:
         1. TemporalEncoder: LSTM projects time-series → embeddings
@@ -677,6 +677,11 @@ class MacroDGRCL(nn.Module):
         stock_h = self.stock_embedding_norm(stock_h)
         macro_h = self.macro_embedding_norm(macro_h)
         
+        # LayerNorm's learned bias re-introduces non-zero values for inactive nodes
+        # Re-zero after norm to prevent these from entering the graph learner
+        if active_mask is not None:
+            stock_h = stock_h * active_mask.unsqueeze(-1).float()
+        
         # 2. Dynamic Graph Learning (Stock→Stock)
         # SAFEGUARD 2: Pass active_mask to sever inactive nodes via -inf masking
         stock_stock_edges, edge_weights = self.graph_learner(
@@ -722,5 +727,13 @@ class MacroDGRCL(nn.Module):
         
         # 5. Multi-Task Head
         direction_logits, magnitude_preds = self.output_head(h)
+        
+        # SAFEGUARD 5: Mask inactive logits
+        # Even with zeroed inputs from Safeguard 4, the linear layers
+        # inside output_head have biases that produce non-zero outputs.
+        # This keeps inactive node logits strictly at 0.0.
+        if active_mask is not None:
+            direction_logits = direction_logits * active_mask.unsqueeze(-1).float()
+            magnitude_preds = magnitude_preds * active_mask.unsqueeze(-1).float()
         
         return direction_logits, magnitude_preds

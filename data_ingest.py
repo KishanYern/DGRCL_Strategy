@@ -145,11 +145,11 @@ def generate_mock_historical_constituents(csv_path: str):
         # More recent additions
         "PLTR", "DDOG", "ZS", "SNOW", "NET", "TEAM", "MDB",
         "COIN", "RIVN", "LCID", "CEG", "CARR", "OTIS", "CTVA",
-        "DOW", "IR", "BKR", "TECH", "MRNA", "ENPH", "SEDG",
+        "TECH", "MRNA", "ENPH", "SEDG",
         "GNRC", "MPWR", "ON", "SMCI", "DECK", "PODD", "AXON",
     ]
     
-    # Deduplicate
+    # Deduplicate (handles any remaining overlapping symbols)
     ticker_pool = sorted(list(set(ticker_pool)))
     
     # Start with ~490 tickers from the pool
@@ -325,14 +325,14 @@ def main():
     
     # 4. Build UNION date index (instead of intersection)
     # This ensures we have dates for all tickers, even those with partial histories
-    print("\nBuilding union date index...")
+    print("\nBuilding equity union date index...")
     
-    all_indices = [df.index for df in macro_data.values()] + \
-                  [df.index for df in stock_data.values()]
-    
-    # Union: every date that ANY ticker has data for
-    union_index = all_indices[0]
-    for idx in all_indices[1:]:
+    # FIX #6: Only use equity indices for the canonical trading calendar.
+    # Macro tickers (futures/FX) trade on different days (weekends/holidays).
+    # Using them in the union injects spurious zero-return days into equities.
+    equity_indices = [df.index for df in stock_data.values()]
+    union_index = equity_indices[0]
+    for idx in equity_indices[1:]:
         union_index = union_index.union(idx)
     
     union_index = union_index.sort_values()
@@ -342,32 +342,9 @@ def main():
     # 5. PROCESS-FIRST, REINDEX-LAST
     # All indicators and normalization were computed on valid data in process_ticker_data().
     # Now we reindex to the union and zero-fill as the FINAL step.
+    # Note: Cross-sectional demeaning and re-normalization are now handled inside the
+    # training loop (data_loader.py) to prevent data leakage (Fixes #1 & #2).
     
-    # 5a. Cross-Sectional Mean Subtraction on valid returns first
-    print("\nApplying Cross-Sectional Mean Subtraction to Returns...")
-    
-    # Build returns matrix aligned to union index (with NaN for missing dates)
-    returns_matrix = pd.DataFrame(index=union_index)
-    for ticker, df in stock_data.items():
-        # Reindex but use NaN (not zero) for the cross-sectional mean calculation
-        aligned = df['Returns'].reindex(union_index)
-        returns_matrix[ticker] = aligned
-    
-    # Cross-sectional mean ignoring NaN (only active stocks contribute)
-    market_return = returns_matrix.mean(axis=1)  # NaN-aware mean
-    
-    # Subtract market return from each stock's valid returns
-    demeaned_returns = {}
-    for ticker in stock_data:
-        valid_returns = stock_data[ticker]['Returns'].copy()
-        # Only subtract on dates where this stock has valid data
-        common_dates = valid_returns.index.intersection(market_return.index)
-        valid_returns.loc[common_dates] -= market_return.loc[common_dates]
-        demeaned_returns[ticker] = valid_returns
-    
-    print("Returns are now market-neutral (cross-sectional mean subtracted).")
-    
-    # 5b. Reindex and zero-fill as the ABSOLUTE FINAL step
     print("\nReindexing all data to union index and zero-filling...")
     
     # Save macro data (reindexed + zero-filled)
@@ -375,29 +352,10 @@ def main():
         aligned_df = df.reindex(union_index).fillna(0)
         aligned_df.to_csv(f"{PROCESSED_DIR}/macro_{name}.csv")
     
-    # Save stock data (reindexed + zero-filled, with demeaned returns applied)
+    # Save stock data (reindexed + zero-filled)
     valid_stocks = []
     for ticker, df in stock_data.items():
-        df_final = df.copy()
-
-        # FIX #3: Re-apply rolling z-score to the demeaned returns so the
-        # Returns FEATURE stays on the same ~N(0,1) scale as every other
-        # feature column going into the LSTM.
-        #
-        # Problem: rolling_zscore_normalize() already ran in process_ticker_data(),
-        # but cross-sectional demeaning then overwrites df['Returns'] with a raw
-        # demeaned log-return (~0.002 scale), breaking feature consistency.
-        #
-        # Solution: treat the demeaned return as a fresh raw series and
-        # re-normalize it with the same rolling-z approach.
-        raw_demeaned_series = demeaned_returns[ticker]
-        # Build a single-column DataFrame so rolling_zscore_normalize works
-        raw_ret_df = pd.DataFrame({'Returns': raw_demeaned_series})
-        renorm = rolling_zscore_normalize(raw_ret_df, window=60)['Returns']
-        df_final['Returns'] = renorm
-
-        # Reindex to union and THEN zero-fill (Process-First, Reindex-Last)
-        aligned_df = df_final.reindex(union_index).fillna(0)
+        aligned_df = df.reindex(union_index).fillna(0)
         aligned_df.to_csv(f"{PROCESSED_DIR}/stock_{ticker}.csv")
         valid_stocks.append(ticker)
     

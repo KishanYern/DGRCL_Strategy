@@ -345,19 +345,54 @@ def create_backtest_folds(
     print(f"  Snapshot step size: {step_size} days")
     
     for fold in folds:
+        # FIX #1 & #2: Compute cross-sectional demean and rolling z-score per fold
+        start_t = max(0, fold.train_start - window_size)
+        end_t = fold.val_end
+        
+        ret_slice = returns_data[:, start_t:end_t].clone()
+        mask_slice = inclusion_mask[:, start_t:end_t]
+        stock_slice = stock_data[:, start_t:end_t, :].clone()
+        macro_slice = macro_data[:, start_t:end_t, :]
+        
+        # 1. Cross-sectional demeaning using ONLY active stocks (prevents survivorship bias leakage)
+        active_counts = mask_slice.sum(dim=0).clamp(min=1)
+        market_rets = (ret_slice * mask_slice).sum(dim=0) / active_counts
+        demeaned_rets = ret_slice - market_rets.unsqueeze(0)
+        
+        # 2. Re-normalize using causal rolling stats within the fold bounds
+        renorm_rets = torch.zeros_like(demeaned_rets)
+        T_slice = demeaned_rets.size(1)
+        for t in range(T_slice):
+            w_start = max(0, t - window_size)
+            if w_start < t:
+                # Stats are from [t-window, t-1], purely causal
+                window_data = demeaned_rets[:, w_start:t]
+                m = window_data.mean(dim=1)
+                s = window_data.std(dim=1, unbiased=True).clamp(min=1e-8)
+                renorm_rets[:, t] = (demeaned_rets[:, t] - m) / s
+                
+        # Returns column is conventionally at the last index (-1)
+        stock_slice[:, :, -1] = renorm_rets
+        
+        # Adjust indices because we sliced the tensors
+        fold_train_start = fold.train_start - start_t
+        fold_train_end = fold.train_end - start_t
+        fold_val_start = fold.val_start - start_t
+        fold_val_end = fold.val_end - start_t
+        
         train_snapshots = _create_snapshots(
-            stock_data, macro_data, returns_data, inclusion_mask,
-            start_idx=fold.train_start,
-            end_idx=fold.train_end,
+            stock_slice, macro_slice, demeaned_rets, mask_slice,
+            start_idx=fold_train_start,
+            end_idx=fold_train_end,
             window_size=window_size,
             forecast_horizon=forecast_horizon,
             step_size=step_size
         )
         
         val_snapshots = _create_snapshots(
-            stock_data, macro_data, returns_data, inclusion_mask,
-            start_idx=fold.val_start,
-            end_idx=fold.val_end,
+            stock_slice, macro_slice, demeaned_rets, mask_slice,
+            start_idx=fold_val_start,
+            end_idx=fold_val_end,
             window_size=window_size,
             forecast_horizon=forecast_horizon,
             step_size=step_size
