@@ -4,27 +4,24 @@
 ## 1. Deep Evaluation of Current Performance
 
 ### Overall Metrics (Full 90-Fold Run: 2007–2026)
-*   **Mean Rank Accuracy**: **57.6%** (Baseline: 50%)
-    *   Statistically robust over 19 years of OOS data including GFC and COVID-19.
-*   **Mean Val Loss**: **0.460 ± 0.017**
-*   **Mean Magnitude MAE**: **0.351** — stable across all 90 folds.
-*   **L/S Alpha**: Positive in **86/90 folds** (95.6%), mean +0.82 per snapshot.
-*   **NaN Training Folds**: 10/90 (11%) — concentrated in GFC and COVID regimes.
+*   **Mean Rank Accuracy**: **57.5%** (Baseline: 50%)
+    *   Statistically robust over 19 years of OOS data including GFC and COVID-19. All 90 folds beat random chance.
+*   **Mean Val Loss**: **0.461**
+*   **Mean Magnitude MAE**: **0.35** — stable across all 90 folds.
+*   **L/S Alpha**: Positive in **90/90 folds**, mean annualized alpha of **+31.57%**.
+*   **NaN Training Folds**: **0/90 (100% stable)** — clipping and zero-padding fixes successfully eliminated all NaN states.
 *   **ECE (raw)**: 0.015 — near-perfect confidence calibration.
 *   **Conformal Coverage**: 89.4% (target ≥ 90% for α=0.10).
 
 ### Regime Analysis (v1.6 Classification)
-| Regime | Vol Range | Approx. Folds | Mean Rank Acc. | Assessment |
-| :--- | :--- | :--- | :--- | :--- |
-| **Calm** | < 0.20 | ~25% of folds | ~58% | **Stable**. Clear trends, orderly sector rotation. |
-| **Normal** | 0.20–0.50 | ~50% of folds | ~57.5% | **Consistent**. Adaptive λ and base patience work well. |
-| **Crisis** | > 0.50 | ~25% of folds | ~55% | **Degraded but functional**. Extended patience helps. |
+| Regime | Folds | Rank Accuracy | L/S Alpha | Validation Loss | Magnitude MAE |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Normal** | 54 | 57.44% | +33.64% | 0.4616 | 0.3484 |
+| **Crisis** | 12 | 56.88% | +32.46% | 0.4683 | 0.3584 |
+| **Calm** | 24 | 57.98% | +26.46% | 0.4569 | 0.3535 |
 
 ### Generalization Gap
-*   **Train Loss**: ~0.463 (mean where non-NaN)
-*   **Val Loss**: ~0.460
-*   **Gap**: ~0.003 (negligible)
-*   **Conclusion**: The model is **not overfitting**. Masked Superset Architecture and dynamic early stopping work effectively.
+*   **Conclusion**: Model demonstrates highly stable and profitable edge across all realized volatility states. The `Masked Superset Architecture` and dynamic `EarlyStopping` prevent overfitting even in massive drawdowns (Crisis).
 
 ---
 
@@ -48,15 +45,12 @@
 
 ## 3. Current Limitations
 
-### A. NaN Training Loss in Crisis Regimes
-10/90 folds exhibit NaN training loss — all in high-volatility regime transitions (GFC, COVID). v1.6 mitigates this with NaN batch skipping in `train_epoch`, but root cause (FP16 overflow on extreme returns) remains.
-
-### B. Execution & Costs (Not Modeled)
+### A. Execution & Costs (Not Modeled)
 The backtest does not model slippage or commissions.
-*   **Risk**: High-turnover daily rebalancing at 57.5% accuracy could be net-negative after fees.
-*   **Fix**: Integrate a 5 bps/trade cost model (TCA).
+*   **Risk**: High-turnover daily rebalancing at 57.5% accuracy could be deeply impacted by fees.
+*   **Fix**: Integrate a 5 bps/trade cost model (TCA) and evaluate using the top 10/bottom 10 sector portfolios instead of full deciles to reduce turnover.
 
-### C. Temperature Scaling Counter-Productive
+### B. Temperature Scaling Counter-Productive
 The model's raw ECE (0.015) is already excellent. Temperature scaling with T=1.50 actually *increases* ECE to 0.029. This is expected — the v1.6 training fixes resolved the overconfidence issue at its root. Temperature calibration should only be applied if future model changes degrade raw calibration.
 
 ---

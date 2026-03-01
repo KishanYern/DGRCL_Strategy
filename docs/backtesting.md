@@ -20,17 +20,17 @@ DGRCL uses **Walk-Forward Validation** (Rolling Window Backtesting) to simulate 
 Measures the percentage of correctly ranked pairs within the same sector.
 - **Random Baseline**: 50%
 - **Edge**: >52% consistently is considered alpha.
-- **v1.6 Result**: Mean **57.6%**, peak **61.3%** (Fold 76), all 90 folds above 50%.
+- **v1.6 Result**: Mean **57.5%**, peak **61.0%** (Fold 50), all 90 folds beat random chance (min 51.7%).
 
 $$ \text{Rank Acc} = \frac{\text{Correct Pairs}}{\text{Total Valid Pairs}} $$
 
 ### B. Magnitude Mean Absolute Error (MAE)
-- **v1.6 Result**: Mean **0.351** — stable across folds.
+- **v1.6 Result**: Mean **0.352** — stable across all folds regardless of regime.
 - Error of ~0.35 log-standard-deviations ≈ ±0.5% in raw return terms.
 
 ### C. Long-Short Alpha (v1.6 — Rec 8)
 Sector-balanced long-short return spread: buy top-20% and sell bottom-20% within each GICS sector.
-- **v1.6 Result**: Positive in **86/90 folds** (95.6%), mean +0.82 per snapshot.
+- **v1.6 Result**: Mean **+31.57%** annualized active return, positive in 90/90 folds. Peak regime: Normal (+33.64%), Calm (+26.46%).
 
 ### D. Confidence Calibration (v1.6 — Recs 2, 6)
 - **ECE (raw)**: 0.015 — near-perfect calibration.
@@ -77,10 +77,9 @@ Regime, realized_vol, and adaptive_lambda are persisted per fold in `fold_result
 | Backtest Version | NaN Folds | Mitigation |
 |-----------------|-----------|------------|
 | v1.5 | ~12% | None |
-| v1.6 (first run) | 11% (10/90) | `max_grad_norm=0.5` + per-fold `GradScaler` |
-| v1.6 (with NaN guard) | TBD | + NaN batch skipping in `train_epoch` |
+| v1.6 | **0% (0/90)** | `max_grad_norm=0.5` + explicit zero-padding isolation + active-only $\sigma$ scaling |
 
-NaN folds cluster around GFC (2008–2010) and COVID (2020) regime transitions. Val metrics remain reasonable because best checkpoints are saved before NaN occurs.
+The v1.6 interventions completely eliminated the NaN cascade problem. Even during extreme volatility spikes (GFC, COVID), the model remained 100% stable in all 90 out-of-sample walk-forward folds.
 
 ## 6. Running the Full Pipeline
 
