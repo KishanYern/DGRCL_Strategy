@@ -327,7 +327,7 @@ def main():
     # This ensures we have dates for all tickers, even those with partial histories
     print("\nBuilding equity union date index...")
     
-    # FIX #6: Only use equity indices for the canonical trading calendar.
+    # Only use equity indices for the canonical trading calendar.
     # Macro tickers (futures/FX) trade on different days (weekends/holidays).
     # Using them in the union injects spurious zero-return days into equities.
     equity_indices = [df.index for df in stock_data.values()]
@@ -342,8 +342,8 @@ def main():
     # 5. PROCESS-FIRST, REINDEX-LAST
     # All indicators and normalization were computed on valid data in process_ticker_data().
     # Now we reindex to the union and zero-fill as the FINAL step.
-    # Note: Cross-sectional demeaning and re-normalization are now handled inside the
-    # training loop (data_loader.py) to prevent data leakage (Fixes #1 & #2).
+    # Note: Cross-sectional demeaning and re-normalization are handled inside the
+    # training loop (data_loader.py) to prevent data leakage.
     
     print("\nReindexing all data to union index and zero-filling...")
     

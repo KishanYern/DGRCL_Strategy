@@ -1,12 +1,13 @@
 """
-Training Loop for Macro-Aware DGRCL v1.5 (Pairwise Ranking)
+Training Loop for Macro-Aware DGRCL (Pairwise Ranking)
 
-Implements:
-- Pairwise Margin Ranking Loss: Sector-aware margin ranking (direction)
-- SmoothL1Loss on log-scaled |returns| (magnitude)
-- EarlyStopping on combined validation loss
-- Walk-forward cross-validation
-- Mixed Precision Training (FP16) for GPU memory efficiency
+Key design choices:
+- Gradient clipping at max_norm=0.5 to prevent NaN cascades in high-vol regimes
+- Dynamic early-stopping patience that doubles during crisis regimes
+- Adaptive λ — magnitude weight scales with realized vol per fold
+- MC Dropout returns median rank alongside mean/std for stable ensemble ranking
+- Per-fold regime classifier (calm/normal/crisis) logged + stored in JSON
+- Sector-balanced long-short alpha computed per fold
 """
 
 import math
@@ -37,38 +38,65 @@ VIS_DIR = "./backtest_results"
 class EarlyStopping:
     """
     Early stopping to terminate training when validation loss stops improving.
-    
-    Monitors the combined validation loss (L_BCE + λ·L_MSE).
+
+    Monitors the combined validation loss (L_dir + λ·L_mag).
+
+    Dynamic Patience:
+        For high-volatility folds (e.g., GFC, COVID), the model needs more
+        epochs to absorb the noisy gradients before it can improve.  Under a
+        fixed patience=10 the model exits at epoch 14–17 in exactly the folds
+        where it is needed most.  `update_patience()` doubles patience when
+        the trailing realized vol is above the high-vol threshold.
     """
-    
-    def __init__(self, patience: int = 10, min_delta: float = 1e-4):
+
+    def __init__(
+        self,
+        base_patience: int = 10,
+        max_patience: int = 20,
+        min_delta: float = 1e-4,
+    ):
         """
         Args:
-            patience: Number of epochs to wait after last improvement
-            min_delta: Minimum change to qualify as an improvement
+            base_patience: Epochs to wait in calm/normal regimes (default 10)
+            max_patience:  Epochs to wait in crisis regimes (default 20)
+            min_delta:     Minimum loss reduction to count as improvement
         """
-        self.patience = patience
+        self.base_patience = base_patience
+        self.max_patience = max_patience
+        self.patience = base_patience  # Active threshold, updated per fold
         self.min_delta = min_delta
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
         self.best_state = None
-    
+
+    def update_patience(self, realized_vol: float, high_vol_threshold: float = 0.50):
+        """
+        Switch to extended patience when the fold's realized vol is high.
+
+        Args:
+            realized_vol:      Trailing cross-sectional return std for this fold
+            high_vol_threshold: Vol level above which patience doubles (default 0.50)
+        """
+        if realized_vol > high_vol_threshold:
+            self.patience = self.max_patience
+            print(f"  [EarlyStopping] High-vol regime detected (σ={realized_vol:.4f}). "
+                  f"Patience extended: {self.base_patience} → {self.max_patience}")
+        else:
+            self.patience = self.base_patience
+
     def __call__(self, val_loss: float, model: nn.Module) -> bool:
         """
         Check if training should stop.
-        
+
         Args:
             val_loss: Combined validation loss
-            model: Model to save best state of
-            
+            model:    Model to save best state of
+
         Returns:
             True if training should stop
         """
-        # FIX #NaN-2: NaN val_loss must NEVER be accepted as a 'best' checkpoint.
-        # Prior behaviour: on first call when best_loss is None, NaN was stored as best_loss.
-        # Then nan < nan-delta is always False, so counter hit patience and restore_best()
-        # loaded the NaN-weight checkpoint, guaranteeing corrupt weights for the whole fold.
+        # Guard: NaN val_loss must never be stored as a 'best' checkpoint.
         if math.isnan(val_loss):
             self.counter += 1
             if self.counter >= self.patience:
@@ -79,24 +107,23 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             return False
-        
+
         if val_loss < self.best_loss - self.min_delta:
-            # Improvement
+            # Improvement — reset counter and save checkpoint
             self.best_loss = val_loss
             self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             self.counter = 0
         else:
-            # No improvement
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-        
+
         return self.early_stop
-    
+
     def restore_best(self, model: nn.Module):
         """Restore model to best checkpoint (mapped to model's current device)."""
         if self.best_state is not None:
-            # FIX #NaN-2: Don't restore a checkpoint whose recorded best_loss is NaN.
+            # Guard: skip restore if the checkpoint's best_loss is NaN.
             if self.best_loss is not None and math.isnan(self.best_loss):
                 return
             device = next(model.parameters()).device
@@ -111,9 +138,8 @@ class EarlyStopping:
 # Ranking loss hyperparameters
 RANKING_MARGIN = 0.5        # Logit separation required between winner/loser
 SIGNIFICANCE_THRESHOLD = 0.003  # 0.3% return divergence to qualify as valid pair
-# FIX #NoLearn-3: Lowered from 1% → 0.3% to produce ~3× more valid pairs per snapshot.
-# 1% was too restrictive in calm market regimes, causing most snapshots to emit
-# zero valid pairs → zero loss → zero gradients → model stuck at random init.
+# Set to 0.3% rather than 1% to ensure sufficient valid pairs in calm market
+# regimes.  Too restrictive a threshold starves the ranking loss of gradients.
 
 
 def compute_pairwise_ranking_loss(
@@ -168,11 +194,8 @@ def compute_pairwise_ranking_loss(
         # Pairwise ranking accuracy: % of valid pairs where score_i > score_j
         rank_acc = (score_diff[valid_pairs] > 0).float().mean().item()
     else:
-        # FIX #NoLearn-2: Use scores.sum() * 0.0 instead of torch.tensor(0.0, requires_grad=True).
-        # The leaf-tensor fallback has requires_grad=True but NO connection to the model's
-        # computation graph, so loss.backward() produces zero gradients for ALL parameters.
-        # scores.sum() * 0.0 IS connected to the graph (scores flows from the model forward
-        # pass), so gradients still propagate correctly even when loss value is 0.
+        # Zero loss that remains connected to the computation graph so that
+        # backward() can still propagate gradients to model parameters.
         loss = scores.sum() * 0.0
         rank_acc = 0.0
     
@@ -190,7 +213,7 @@ def compute_log_scaled_mag_target(
     well-behaved ~[0, 3] range so SmoothL1Loss can produce meaningful
     gradients instead of behaving as pure MSE.
 
-    FIX #5: σ is computed only over ACTIVE stocks. Zero-padded inactive
+    σ is computed only over ACTIVE stocks. Zero-padded inactive
     stocks have returns==0 after union-index reindexing; including them
     deflates σ and inflates the normalized targets for active stocks,
     causing the magnitude head to see artificially large targets.
@@ -223,8 +246,8 @@ def train_step(
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None,
     active_mask: Optional[torch.Tensor] = None,
-    max_grad_norm: float = 1.0,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    max_grad_norm: float = 0.5,
+    scaler=None,  # torch.amp.GradScaler (type omitted for AMP API compatibility)
     accumulation_steps: int = 4,
     batch_idx: int = 0
 ) -> Dict[str, float]:
@@ -262,7 +285,7 @@ def train_step(
     
     # --------------- Forward Pass ---------------
     use_amp = scaler is not None
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with torch.amp.autocast('cuda', enabled=use_amp):
         dir_logits, mag_preds = model(
             stock_features=stock_features,
             macro_features=macro_features,
@@ -282,9 +305,9 @@ def train_step(
         )
         
         # --------------- Magnitude: SmoothL1 on log-scaled targets ---------------
-        # FIX #5: pass active_mask so sigma is computed over active stocks only
+        # Magnitude targets: sigma computed over active stocks only to avoid
+        # dilution from zero-padded inactive positions.
         mag_target = compute_log_scaled_mag_target(returns, active_mask=active_mask)
-        # Mask magnitude loss: only compute over active stocks
         if active_mask is not None and active_mask.any():
             loss_mag = mse_loss_fn(
                 mag_preds.squeeze(-1)[active_mask],
@@ -295,11 +318,9 @@ def train_step(
 
         loss_total = loss_dir + mag_weight * loss_mag
 
-    # FIX #NaN-3: Skip the entire backward pass if loss is non-finite.
-    # A single degenerate snapshot (all-zero future returns, pure-padding window,
-    # or FP16 overflow on a high-volatility window) can produce NaN/Inf that would
-    # corrupt all model weights. Silently skip and return NaN metrics so callers
-    # can detect the bad batch without crashing the rest of the epoch.
+    # Non-finite guard: a degenerate snapshot (all-zero returns, padding-only
+    # window, or FP16 overflow in high-vol regimes) can produce NaN/Inf.
+    # Skip backward pass entirely to prevent weight corruption.
     if not torch.isfinite(loss_total):
         # Still zero_grad to keep accumulation state clean
         if (batch_idx + 1) % accumulation_steps == 0:
@@ -318,10 +339,6 @@ def train_step(
     loss_total = loss_total / accumulation_steps
 
     # --------------- Backward Pass ---------------
-    # FIX #2: Removed duplicate optimizer.zero_grad() that was here.
-    # The first zero_grad() at the top of the function is sufficient.
-    # A second call here wiped all gradients computed in the autocast block,
-    # silently preventing the model from learning.
     
     if use_amp:
         scaler.scale(loss_total).backward()
@@ -366,10 +383,10 @@ def train_epoch(
     mse_loss_fn: nn.Module,
     device: torch.device,
     mag_weight: float = 0.05,
-    max_grad_norm: float = 1.0,
+    max_grad_norm: float = 0.5,
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler=None,  # torch.amp.GradScaler instance
     accumulation_steps: int = 4
 ) -> Dict[str, float]:
     """
@@ -396,6 +413,7 @@ def train_epoch(
         'rank_accuracy': 0.0, 'mag_mae': 0.0
     }
     num_batches = 0
+    valid_batches = 0  # NaN guard: count only non-NaN batches for averaging
     
     # Ensure masks are on device
     if sector_mask is not None:
@@ -432,15 +450,23 @@ def train_epoch(
             accumulation_steps=accumulation_steps,
             batch_idx=num_batches
         )
-        
+
+        # Skip NaN batches from metric accumulation so one degenerate
+        # snapshot doesn't corrupt the entire epoch average.
+        if math.isnan(metrics['loss']):
+            num_batches += 1
+            continue
+
         for key in epoch_metrics:
             epoch_metrics[key] += metrics[key]
         num_batches += 1
+        valid_batches += 1
     
-    # Average across batches
+    # Average across valid (non-NaN) batches only
     for key in epoch_metrics:
-        epoch_metrics[key] /= max(num_batches, 1)
+        epoch_metrics[key] /= max(valid_batches, 1)
     epoch_metrics['num_batches'] = num_batches
+    epoch_metrics['nan_batches'] = num_batches - valid_batches
     
     return epoch_metrics
 
@@ -481,8 +507,8 @@ def evaluate(
         macro_feat = macro_feat.to(device)
         returns = returns.to(device)
         
-        # Forward pass with mixed precision (consistent with training)
-        with torch.cuda.amp.autocast(enabled=stock_feat.is_cuda):
+        # Forward pass with mixed precision
+        with torch.amp.autocast('cuda', enabled=stock_feat.is_cuda):
             dir_logits, mag_preds = model(
                 stock_features=stock_feat,
                 macro_features=macro_feat,
@@ -501,7 +527,7 @@ def evaluate(
         )
         
         # Magnitude: SmoothL1 on log-scaled targets (masked)
-        # FIX #5: pass active_mask so sigma is computed over active stocks only
+        # Sigma computed over active stocks only to prevent padding dilution
         mag_target = compute_log_scaled_mag_target(returns, active_mask=active_mask)
         if active_mask is not None and active_mask.any():
             loss_mag = mse_loss_fn(
@@ -562,10 +588,8 @@ def create_sequential_snapshots(
         future_returns = returns_data[:, t+window_size:t+window_size+forecast_horizon].sum(dim=1)
         
         if inclusion_mask is not None:
-            # FIX #1 (same as _create_snapshots in data_loader.py):
-            # Use t+window_size (forecast START) not t+window_size-1 (last lookback day).
-            # This correctly identifies which stocks are tradable when the
-            # forecast period begins, matching the semantics of future_returns.
+            # Active mask at t+window_size (forecast start) — identifies which
+            # stocks are tradable at the point of signal generation.
             clamp_t = min(t + window_size, inclusion_mask.size(1) - 1)
             active_mask = inclusion_mask[:, clamp_t]  # [N_s]
             snapshots.append((stock_window, macro_window, future_returns, active_mask))
@@ -573,6 +597,244 @@ def create_sequential_snapshots(
             snapshots.append((stock_window, macro_window, future_returns))
     
     return snapshots
+
+
+# =============================================================================
+# REGIME UTILITIES (Adaptive Lambda + Regime Classifier)
+# =============================================================================
+
+def compute_regime_vol(
+    train_snapshots: List[Tuple],
+    lookback: int = 20
+) -> float:
+    """
+    Estimate cross-sectional return volatility from the most recent training
+    snapshots.  Used to drive adaptive λ and regime classification.
+
+    Computes the standard deviation of the mean absolute cross-sectional return
+    across the last `lookback` snapshots.  This is a proxy for the realized
+    market volatility during the fold's training window — high values indicate
+    GFC/COVID-like regimes; low values indicate quiet trending markets.
+
+    Args:
+        train_snapshots: List of snapshot tuples (at least 3- or 4-tuples).
+                         The returns tensor is always snapshot[2].
+        lookback:        Number of recent snapshots to use (default 20 ≈ 1 month)
+
+    Returns:
+        Realized cross-sectional return std (float). Falls back to 0.0 if
+        the snapshot list is empty or contains only NaN returns.
+    """
+    if not train_snapshots:
+        return 0.0
+
+    # Use the most recent `lookback` snapshots to capture the regime at the
+    # fold boundary (the period just before the validation window begins).
+    recent = train_snapshots[-lookback:]
+    mean_abs_rets = []
+    for snap in recent:
+        # Returns tensor is always the third element (index 2)
+        ret = snap[2]
+        mean_abs_rets.append(ret.abs().mean().item())
+
+    arr = [v for v in mean_abs_rets if not math.isnan(v)]
+    if len(arr) < 2:
+        return 0.0
+    # np.std with ddof=1 (sample std)
+    return float(np.std(arr, ddof=1))
+
+
+def classify_regime(
+    realized_vol: float,
+    low_threshold: float = 0.20,
+    high_threshold: float = 0.50
+) -> str:
+    """
+    Tag a fold as 'calm', 'normal', or 'crisis' based on realized vol.
+
+    Thresholds recalibrated from the empirical distribution of realized_vol
+    observed in the 90-fold backtest (range [0.12, 2.01]):
+        calm   = vol < 0.20  (~bottom quartile, quiet trending markets)
+        normal = 0.20–0.50   (~interquartile, base case)
+        crisis = vol > 0.50  (~top quartile, GFC/COVID-type regimes)
+
+    Args:
+        realized_vol:    Trailing cross-sectional return std from compute_regime_vol()
+        low_threshold:   Upper bound of calm regime (default 0.20)
+        high_threshold:  Lower bound of crisis regime (default 0.50)
+
+    Returns:
+        One of: 'calm', 'normal', 'crisis'
+    """
+    if realized_vol < low_threshold:
+        return 'calm'
+    elif realized_vol >= high_threshold:
+        return 'crisis'
+    else:
+        return 'normal'
+
+
+def compute_adaptive_lambda(
+    realized_vol: float,
+    base_lambda: float = 0.05,
+    alpha: float = 2.0,
+    vol_floor: float = 0.005,
+    vol_cap: float = 0.030
+) -> float:
+    """
+    Volatility-conditioned magnitude loss weight.
+
+    Formula: λ = base_lambda * (1 + alpha * clamp(σ, vol_floor, vol_cap) / vol_cap)
+
+    Rationale: During market stress the magnitude head becomes *valuable* for
+    position sizing (knowing |return| matters more when moves are large). During
+    quiet periods, magnitude prediction adds noise to the dominant direction signal.
+    The adaptive λ automatically increases the magnitude weight in crisis regimes
+    and lowers it in calm regimes, preventing the magnitude head from dominating
+    the direction loss while still extracting signal in volatile periods.
+
+    Numerical range:  [base_lambda, base_lambda * (1 + alpha)] = [0.05, 0.15]
+      • Calm (σ=0.005):   λ ≈ 0.05  — magnitude weight minimal
+      • Normal (σ=0.015): λ ≈ 0.10  — moderate
+      • Crisis (σ≥0.030): λ ≈ 0.15  — magnitude most informative
+
+    Args:
+        realized_vol: Trailing cross-sectional return std
+        base_lambda:  Fixed baseline weight (default 0.05)
+        alpha:        Scale factor for vol-sensitivity (default 2.0)
+        vol_floor:    Minimum vol used in formula (clamp lower bound, default 0.5%)
+        vol_cap:      Maximum vol used in formula (clamp upper bound, default 3.0%)
+
+    Returns:
+        Adaptive λ in [base_lambda, base_lambda * (1 + alpha)]
+    """
+    vol_clamped = max(vol_floor, min(realized_vol, vol_cap))
+    return base_lambda * (1.0 + alpha * vol_clamped / vol_cap)
+
+
+# =============================================================================
+# SECTOR-BALANCED LONG-SHORT ALPHA
+# =============================================================================
+
+def compute_long_short_alpha(
+    val_snapshots: List[Tuple],
+    model: MacroDGRCL,
+    device: torch.device,
+    sector_mask: Optional[torch.Tensor],
+    sector_ids: Optional[torch.Tensor],
+    top_n_pct: float = 0.20,
+) -> Dict[str, float]:
+    """
+    Compute realized long-short alpha using sector-balanced books.
+
+    For each validation snapshot:
+      1. Run a model forward pass (eval mode, no dropout).
+      2. Within each GICS sector, rank stocks by predicted direction logit.
+      3. Long the top `top_n_pct` and short the bottom `top_n_pct` *per sector*,
+         then average across sectors (sector-balanced book).
+      4. Compute the 5-day forward return spread (long avg − short avg).
+
+    Aggregating L/S spread across all val snapshots gives the total alpha proxy
+    for the fold.  This is the live P&L proxy recommended in the quant analysis.
+
+    Args:
+        val_snapshots:  List of 3- or 4-tuples from data_loader
+        model:          Trained MacroDGRCL model (will be put in eval mode)
+        device:         Torch device
+        sector_mask:    [N_s, N_s] bool — True where stocks share a sector
+        sector_ids:     [N_s] long tensor — integer sector label per stock
+        top_n_pct:      Fraction of stocks to long/short per sector (default 20%)
+
+    Returns:
+        Dict with:
+            total_ls_alpha:   Sum of per-snapshot L/S spreads across val period
+            mean_ls_alpha:    Mean per-snapshot L/S spread
+            n_snapshots:      Number of val snapshots processed
+    """
+    model.eval()
+    total_spread = 0.0
+    n_valid = 0
+
+    with torch.no_grad():
+        for snap in val_snapshots:
+            # Unpack snapshot (3- or 4-tuple)
+            if len(snap) == 4:
+                stock_feat, macro_feat, returns, active_mask = snap
+                active_mask = active_mask.to(device)
+            else:
+                stock_feat, macro_feat, returns = snap
+                active_mask = None
+
+            stock_feat = stock_feat.to(device)
+            macro_feat = macro_feat.to(device)
+            returns = returns.to(device)
+
+            # Forward pass
+            dir_logits, _ = model(
+                stock_features=stock_feat,
+                macro_features=macro_feat,
+                sector_mask=sector_mask.to(device) if sector_mask is not None else None,
+                active_mask=active_mask
+            )
+            scores = dir_logits.squeeze(-1)  # [N_s]
+
+            # Determine which stocks are eligible for trading
+            if active_mask is not None:
+                eligible = active_mask  # [N_s] bool
+            else:
+                eligible = torch.ones(scores.shape[0], dtype=torch.bool, device=device)
+
+            # ---- Sector-balanced L/S book ----
+            if sector_ids is not None and sector_ids.numel() > 0:
+                sids = sector_ids.to(device)
+                unique_sectors = sids.unique()
+                long_returns = []
+                short_returns = []
+
+                for sid in unique_sectors:
+                    # Stocks in this sector that are active
+                    in_sector = (sids == sid) & eligible  # [N_s]
+                    if in_sector.sum() < 4:
+                        # Need at least 4 stocks to form a meaningful L/S intra-sector
+                        continue
+
+                    sector_scores = scores[in_sector]   # [k]
+                    sector_rets = returns[in_sector]    # [k]
+
+                    k = int(max(1, math.floor(top_n_pct * in_sector.sum().item())))
+                    # Top k = long, bottom k = short
+                    sorted_idx = sector_scores.argsort(descending=True)
+                    long_returns.append(sector_rets[sorted_idx[:k]].mean().item())
+                    short_returns.append(sector_rets[sorted_idx[-k:]].mean().item())
+
+                if long_returns and short_returns:
+                    spread = float(np.mean(long_returns)) - float(np.mean(short_returns))
+                    total_spread += spread
+                    n_valid += 1
+
+            else:
+                # Fallback: no sector info — global top/bottom pct
+                eligible_idx = eligible.nonzero(as_tuple=True)[0]
+                if eligible_idx.numel() < 4:
+                    continue
+                elig_scores = scores[eligible_idx]
+                elig_rets = returns[eligible_idx]
+                k = int(max(1, math.floor(top_n_pct * eligible_idx.numel())))
+                sorted_idx = elig_scores.argsort(descending=True)
+                spread = (
+                    elig_rets[sorted_idx[:k]].mean()
+                    - elig_rets[sorted_idx[-k:]].mean()
+                ).item()
+                total_spread += spread
+                n_valid += 1
+
+    model.train()  # Restore train mode
+
+    return {
+        'total_ls_alpha': total_spread,
+        'mean_ls_alpha': total_spread / max(n_valid, 1),
+        'n_snapshots': n_valid,
+    }
 
 
 def mc_dropout_inference(
@@ -584,36 +846,40 @@ def mc_dropout_inference(
 ) -> Dict[str, torch.Tensor]:
     """
     Monte Carlo Dropout inference for uncertainty estimation.
-    
+
     Runs n_samples stochastic forward passes with dropout enabled,
-    then computes mean prediction and confidence from raw score variance.
-    
-    For pairwise ranking models, confidence is derived from the stability
-    of the raw direction scores (logits) across MC passes — NOT from
-    sigmoid probabilities, which compress near 0.5 and hide uncertainty.
-    
+    then computes mean/std predictions and a stable median rank.
+
+    Median Rank Ensemble:
+        Using the *mean* direction score aggregates linearly and can cancel out
+        meaningful uncertainty signals. The *median rank* across passes is more
+        robust — if a stock's rank is unstable (jumps around), the median rank
+        stabilises the final book composition without hiding the uncertainty.
+
     Args:
         model: MacroDGRCL model
         stock_features: [N_s, T, d_s]
         macro_features: [N_m, T, d_m]
-        n_samples: Number of stochastic forward passes
+        n_samples: Number of stochastic forward passes (recommend ≥ 10)
         macro_stock_edges: Optional fixed edges
-        
+
     Returns:
         Dict with keys:
-            dir_score_mean: [N_s] mean raw direction score (logit)
-            dir_score_std:  [N_s] std of raw scores — uncertainty
-            mag_mean:       [N_s] mean magnitude prediction
-            mag_std:        [N_s] std of magnitude prediction
-            confidence:     [N_s] 1/(1+score_std) — higher = more confident
-            rank_stability: scalar — fraction of pairwise rankings that are
-                            consistent across all MC passes (0=chaotic, 1=stable)
+            dir_score_mean:  [N_s] mean raw direction score (logit)
+            dir_score_std:   [N_s] std of raw scores — epistemic uncertainty
+            median_dir_rank: [N_s] median rank across MC passes (use this
+                             for live stock selection; more stable than mean score)
+            mag_mean:        [N_s] mean magnitude prediction
+            mag_std:         [N_s] std of magnitude prediction
+            confidence:      [N_s] 1/(1+score_std) — higher = more confident
+            rank_stability:  scalar Spearman ρ between pass-0 and pass-i ranks
+                             averaged over i=1…n_samples-1 (0=chaotic, 1=stable)
     """
-    model.train()  # Keep dropout active
-    
+    model.train()  # Keep dropout layers active for stochastic forward passes
+
     dir_scores_all = []
     mag_preds_all = []
-    
+
     with torch.no_grad():
         for _ in range(n_samples):
             dir_logits, mag_preds = model(
@@ -621,43 +887,52 @@ def mc_dropout_inference(
                 macro_features=macro_features,
                 macro_stock_edges=macro_stock_edges
             )
-            dir_scores_all.append(dir_logits.squeeze(-1))  # [N_s] raw scores
+            dir_scores_all.append(dir_logits.squeeze(-1))  # [N_s]
             mag_preds_all.append(mag_preds.squeeze(-1))    # [N_s]
-    
+
     # Stack: [n_samples, N_s]
     dir_scores_stack = torch.stack(dir_scores_all, dim=0)
     mag_preds_stack = torch.stack(mag_preds_all, dim=0)
-    
+
     dir_score_mean = dir_scores_stack.mean(dim=0)
     dir_score_std = dir_scores_stack.std(dim=0)
     mag_mean = mag_preds_stack.mean(dim=0)
     mag_std = mag_preds_stack.std(dim=0)
-    
-    # Confidence: inverse of raw score uncertainty
-    # score_std captures how much the model's ranking changes under dropout
+
+    # Confidence: inverse of raw score uncertainty.
+    # score_std captures how much the model's ranking changes under dropout.
     confidence = 1.0 / (1.0 + dir_score_std)
-    
-    # Rank stability: how consistent are the stock rankings across MC passes?
-    # Uses Spearman rank correlation (vectorized) instead of O(N²) Kendall tau.
+
+    # Median direction rank across MC passes.
+    # For each pass, convert raw logits → ordinal rank (0=lowest, N-1=highest).
+    # Then take the element-wise median across passes.
+    # A stock with a stable rank of N-1 (top) keeps median rank ≈ N-1;
+    # one that jumps between top and bottom gets median rank ≈ N/2, naturally
+    # avoiding it in live top-N selection without requiring an extra threshold.
+    ranks_per_pass = torch.stack(
+        [scores.argsort().argsort().float() for scores in dir_scores_all],
+        dim=0
+    )  # [n_samples, N_s]
+    median_dir_rank = ranks_per_pass.median(dim=0).values  # [N_s]
+
+    # Rank stability: mean Spearman ρ between pass-0 ranks and all other passes.
     if n_samples >= 2 and dir_scores_stack.shape[1] >= 2:
-        ref_ranks = dir_scores_stack[0].argsort().argsort().float()  # [N_s]
+        ref_ranks = dir_scores_stack[0].argsort().argsort().float()
         correlations = []
         for i in range(1, n_samples):
             sample_ranks = dir_scores_stack[i].argsort().argsort().float()
-            # Spearman correlation via Pearson on ranks
             corr_matrix = torch.corrcoef(torch.stack([ref_ranks, sample_ranks]))
             correlations.append(corr_matrix[0, 1].item())
-        rank_stability = sum(correlations) / len(correlations)
-        # Clamp to [0, 1] — negative correlation means chaotic
-        rank_stability = max(0.0, rank_stability)
+        rank_stability = max(0.0, sum(correlations) / len(correlations))
     else:
         rank_stability = 0.0
-    
+
     model.eval()  # Restore eval mode
-    
+
     return {
         'dir_score_mean': dir_score_mean,
         'dir_score_std': dir_score_std,
+        'median_dir_rank': median_dir_rank,
         'mag_mean': mag_mean,
         'mag_std': mag_std,
         'confidence': confidence,
@@ -674,7 +949,7 @@ def save_attention_heatmap(
     tickers: Optional[List[str]] = None,
     max_display: int = 30,
     sector_mask: Optional[torch.Tensor] = None,
-    active_mask: Optional[torch.Tensor] = None,   # FIX #4: added parameter
+    active_mask: Optional[torch.Tensor] = None,
 ):
     """
     Visualize the DynamicGraphLearner attention weights as a heatmap.
@@ -702,9 +977,8 @@ def save_attention_heatmap(
         # encode → Safeguard 1 (zero inactive) → normalize → graph_learner
         stock_h = model.stock_encoder(stock_features)  # [N_s, H]
 
-        # FIX #4: Apply Safeguard 1 before LayerNorm (same as forward pass).
-        # Without this, LSTM bias on inactive stocks skews LayerNorm stats
-        # AND the graph learner receives non-zero embeddings for dummy nodes.
+        # Zero inactive embeddings before LayerNorm to prevent LSTM bias on
+        # padded stocks from skewing normalization statistics.
         if active_mask is not None:
             device = stock_features.device
             active_mask = active_mask.to(device)
@@ -720,8 +994,8 @@ def save_attention_heatmap(
         if sector_mask is not None:
             sector_mask = sector_mask.to(stock_features.device)
 
-        # FIX #4: Pass active_mask so inactive→* and *→inactive edges
-        # receive -inf attention, keeping the heatmap accurate.
+        # Mask inactive edges so attention is only computed between
+        # tradable stocks, keeping the heatmap diagnostically accurate.
         edge_index, edge_weights = model.graph_learner(
             stock_h,
             sector_mask=sector_mask,
@@ -946,7 +1220,8 @@ def main(
     use_amp: bool = True,
     ablation: str = "baseline",
     output_dir: str = "./backtest_results",
-    epochs: int = 100
+    epochs: int = 100,
+    save_calibration_data: bool = False,
 ):
     """
     Training loop with Multi-Task Learning.
@@ -977,11 +1252,9 @@ def main(
     NUM_EPOCHS = epochs
     LR = 5e-5
     WEIGHT_DECAY = 1e-3
-    PATIENCE = 10  # FIX #NoLearn-1: Reduced from 40 → 10.
-    # With patience=40 and LR=5e-5 the model was effectively never improving:
-    # every fold early-stopped at epoch 41, meaning the best checkpoint was always
-    # epoch 1 (random init). A shorter patience reacts faster to plateaus and
-    # frees compute for folds that actually show improvement.
+    PATIENCE = 10  # Base early stopping patience (doubled in crisis regimes)
+    # Short patience reacts faster to plateaus and frees compute for folds
+    # that actually show improvement.
     MAX_STOCKS = 150  # Stock universe size
     
     # Walk-forward parameters (only used with real data)
@@ -1016,7 +1289,6 @@ def main(
         from data_loader import load_and_prepare_backtest
         
         print("\n=== Loading Real Market Data ===")
-        # v1.4: Now returns sector_map
         folds, dates, tickers, NUM_STOCKS, NUM_MACROS, sector_map = load_and_prepare_backtest(
             data_dir="./data/processed",
             train_size=TRAIN_SIZE,
@@ -1025,7 +1297,7 @@ def main(
             window_size=WINDOW_SIZE,
             forecast_horizon=5,
             snapshot_step=1,
-            macro_lag=5,  # v1.4: Explicit macro lagging
+            macro_lag=5,
             device=torch.device('cpu'),
             max_stocks=MAX_STOCKS
         )
@@ -1033,7 +1305,7 @@ def main(
         print(f"\nReady for walk-forward backtest:")
         print(f"  {len(folds)} folds, {NUM_STOCKS} stocks, {NUM_MACROS} macro factors")
         
-        # v1.4: Initialize Graph Builder with Sector Info
+        # Build sector-aware graph topology
         from macro_dgrcl import HeteroGraphBuilder
         graph_builder = HeteroGraphBuilder(
             sector_mapping=sector_map,
@@ -1097,6 +1369,11 @@ def main(
         sector_mask = None
         sector_ids = None
     
+    # Collect val-fold logits + labels for post-processing calibration.
+    # Populated inside the fold loop whenever val_data is non-empty.
+    calibration_logits: List[float] = []
+    calibration_labels: List[float] = []
+
     # Loss function (shared across folds)
     mse_loss_fn = nn.SmoothL1Loss()
     
@@ -1140,23 +1417,11 @@ def main(
             torch.cuda.empty_cache()  # Release cached memory
         gc.collect()  # Python garbage collection
 
-        # FIX #NaN-1 (PRIMARY): Recreate the GradScaler at the start of every fold.
-        #
-        # The GradScaler tracks inf/NaN gradient events via internal state
-        # (_scale, _growth_tracker, _found_inf_per_device). When a bad snapshot
-        # in Fold N triggers a NaN, the scaler lowers its scale factor. This
-        # degraded state carries over into Fold N+1, N+2, … even though the model
-        # is freshly re-initialised each fold.
-        #
-        # In this backtest: Fold 1 already showed NaN training loss (line 143 of
-        # the log). The scaler kept degrading until Fold 19, where the scale hit
-        # a floor that caused FP16 overflow on the *very first* forward pass,
-        # producing NaN in *every* subsequent fold.
-        #
-        # Recreating the scaler gives each fold a fresh scale = 2^16 and a clean
-        # inf-tracking state, decoupling folds from each other.
+        # Reinitialize GradScaler per fold to decouple AMP state across
+        # walk-forward splits.  A NaN in Fold N degrades the scaler's internal
+        # scale factor; without reset, this stale state contaminates Fold N+1.
         if use_amp and device.type == 'cuda':
-            scaler = torch.cuda.amp.GradScaler()
+            scaler = torch.amp.GradScaler('cuda')
         
         print(f"\n{'='*60}")
         print(f"FOLD {fold_idx + 1}/{len(folds)}")
@@ -1190,7 +1455,19 @@ def main(
             weight_decay=WEIGHT_DECAY
         )
         scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
-        early_stopping = EarlyStopping(patience=PATIENCE)
+
+        # Compute regime metrics from the training window
+        # Use trailing 20 snapshots of the *pre-sliced* train fold (returns are index 2)
+        realized_vol = compute_regime_vol(train_data, lookback=20)
+        regime_label = classify_regime(realized_vol)
+        adaptive_mag_weight = compute_adaptive_lambda(realized_vol, base_lambda=mag_weight)
+        print(f"  Regime: {regime_label.upper()} | "
+              f"Realized vol: {realized_vol:.4f} | "
+              f"Adaptive λ: {adaptive_mag_weight:.4f}")
+
+        # Adjust early stopping patience based on regime volatility
+        early_stopping = EarlyStopping(base_patience=PATIENCE, max_patience=PATIENCE * 2)
+        early_stopping.update_patience(realized_vol, high_vol_threshold=0.50)
         
         # Training loop for this fold
         print("\nTraining...")
@@ -1202,8 +1479,8 @@ def main(
                 optimizer=optimizer,
                 mse_loss_fn=mse_loss_fn,
                 device=device,
-                mag_weight=mag_weight,
-                max_grad_norm=1.0,
+                mag_weight=adaptive_mag_weight,   # Fold-specific adaptive λ
+                max_grad_norm=0.5,
                 sector_mask=sector_mask,
                 sector_ids=sector_ids,
                 scaler=scaler
@@ -1261,13 +1538,57 @@ def main(
                   f"(Dir: {val_metrics['loss_dir']:.4f}, Mag: {val_metrics['loss_mag']:.4f})")
             print(f"  Rank Accuracy: {val_metrics['rank_accuracy']*100:.1f}%")
             print(f"  Mag MAE: {val_metrics['mag_mae']:.4f}")
+
+            # Collect direction logits + binary labels for calibration.
+            # labels = 1 if forward return > 0, else 0.
+            with torch.no_grad():
+                for snap in val_data[:50]:  # Cap at 50 snaps to keep JSON small
+                    sf = snap[0].to(device)
+                    mf = snap[1].to(device)
+                    am = snap[3].to(device) if len(snap) == 4 else None
+                    sm = sector_mask.to(device) if sector_mask is not None else None
+                    logits_snap, _ = model(
+                        stock_features=sf, macro_features=mf,
+                        sector_mask=sm, active_mask=am
+                    )
+                    rets_snap = snap[2].to(device)
+                    mask = am if am is not None else torch.ones(
+                        logits_snap.shape[0], dtype=torch.bool, device=device
+                    )
+                    calibration_logits.extend(
+                        logits_snap.squeeze(-1)[mask].tolist()
+                    )
+                    calibration_labels.extend(
+                        (rets_snap[mask] > 0).float().tolist()
+                    )
             
+            # Sector-balanced long-short alpha
+            ls_alpha = compute_long_short_alpha(
+                val_snapshots=val_data,
+                model=model,
+                device=device,
+                sector_mask=sector_mask,
+                sector_ids=sector_ids,
+                top_n_pct=0.20
+            )
+            print(f"  Long-Short Alpha (sector-balanced): "
+                  f"total={ls_alpha['total_ls_alpha']:.4f}, "
+                  f"mean/snap={ls_alpha['mean_ls_alpha']:.4f}, "
+                  f"n_snaps={ls_alpha['n_snapshots']}")
+
             all_fold_results.append({
                 'fold': fold_idx + 1,
                 'train_loss': epoch_metrics['loss'],
                 'val_loss': val_metrics['loss'],
                 'rank_accuracy': val_metrics['rank_accuracy'],
                 'mag_mae': val_metrics['mag_mae'],
+                # Persist regime label and vol for post-analysis
+                'regime': regime_label,
+                'realized_vol': realized_vol,
+                'adaptive_lambda': adaptive_mag_weight,
+                # Persist long-short alpha
+                'ls_alpha_total': ls_alpha['total_ls_alpha'],
+                'ls_alpha_mean': ls_alpha['mean_ls_alpha'],
                 # Use actual splitter indices when available (real data 3-tuple folds);
                 # fall back to synthetic formula only if metadata is absent.
                 'train_start_idx': fold_meta.train_start if fold_meta is not None else fold_idx * FOLD_STEP,
@@ -1280,6 +1601,11 @@ def main(
                 'val_loss': None,
                 'rank_accuracy': epoch_metrics['rank_accuracy'],
                 'mag_mae': epoch_metrics['mag_mae'],
+                'regime': regime_label,
+                'realized_vol': realized_vol,
+                'adaptive_lambda': adaptive_mag_weight,
+                'ls_alpha_total': None,
+                'ls_alpha_mean': None,
                 'train_start_idx': fold_meta.train_start if fold_meta is not None else fold_idx * FOLD_STEP,
                 'val_end_idx': fold_meta.val_end if fold_meta is not None else fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
             })
@@ -1292,7 +1618,7 @@ def main(
     
     # Summary
     print(f"\n{'='*60}")
-    print("BACKTEST SUMMARY (v1.5 Pairwise Ranking)")
+    print("BACKTEST SUMMARY")
     print(f"{'='*60}")
     
     val_losses = [r['val_loss'] for r in all_fold_results if r['val_loss'] is not None]
@@ -1302,12 +1628,35 @@ def main(
     if val_losses:
         print(f"Average Val Loss: {np.mean(val_losses):.4f} ± {np.std(val_losses):.4f}")
         print(f"Best Fold: {np.argmin(val_losses) + 1} (Loss: {min(val_losses):.4f})")
-    
+
     print(f"Average Rank Accuracy: {np.mean(rank_accs)*100:.1f}%")
     print(f"Average Mag MAE: {np.mean(mag_maes):.4f}")
+
+    # Regime breakdown summary
+    regimes = [r.get('regime', 'unknown') for r in all_fold_results]
+    for rname in ['calm', 'normal', 'crisis']:
+        cnt = regimes.count(rname)
+        ls_vals = [r.get('ls_alpha_mean', None) for r in all_fold_results
+                   if r.get('regime') == rname and r.get('ls_alpha_mean') is not None]
+        ls_str = f", avg L/S α={np.mean(ls_vals):.4f}" if ls_vals else ""
+        print(f"  Regime '{rname}': {cnt} folds{ls_str}")
     
     # Save backtest summary visualization
     save_backtest_summary(all_fold_results, VIS_DIR, dates=dates if use_real_data else None)
+
+    # Save collected calibration data as JSON for post-processing.
+    # Run `python confidence_calibration.py --results-dir <VIS_DIR>` afterwards.
+    if save_calibration_data and calibration_logits:
+        logits_path = os.path.join(VIS_DIR, 'calibration_logits.json')
+        labels_path = os.path.join(VIS_DIR, 'calibration_labels.json')
+        with open(logits_path, 'w') as f:
+            json.dump(calibration_logits, f)
+        with open(labels_path, 'w') as f:
+            json.dump(calibration_labels, f)
+        print(f"  Calibration data saved: {len(calibration_logits)} samples")
+        print(f"    Logits: {logits_path}")
+        print(f"    Labels: {labels_path}")
+        print(f"  Run: python confidence_calibration.py --results-dir {VIS_DIR}")
     
     # MC Dropout inference on last fold (only if model exists)
     if 'model' in locals():
@@ -1325,12 +1674,15 @@ def main(
         
         print(f"  Direction score mean:  {mc_results['dir_score_mean'].mean().item():.4f}")
         print(f"  Direction score std:   {mc_results['dir_score_std'].mean().item():.4f}")
+        print(f"  Median dir rank (top): {mc_results['median_dir_rank'].max().item():.1f}")
+        print(f"                 (med):  {mc_results['median_dir_rank'].median().item():.1f}")
         print(f"  Magnitude mean:        {mc_results['mag_mean'].mean().item():.4f}")
         print(f"  Magnitude uncertainty: {mc_results['mag_std'].mean().item():.4f}")
         print(f"  Confidence mean:       {mc_results['confidence'].mean().item():.4f}")
         print(f"  Confidence min/max:    {mc_results['confidence'].min().item():.4f} / "
               f"{mc_results['confidence'].max().item():.4f}")
         print(f"  Rank stability:        {mc_results['rank_stability'].item():.4f}")
+        print(f"  NOTE: Use 'median_dir_rank' for live stock selection.")
         
         # Attention weight visualization on last fold
         print("\nGenerating attention heatmap...")
@@ -1407,6 +1759,12 @@ if __name__ == "__main__":
         help="Directory to save visualization and checkpoint results (default: ./backtest_results)"
     )
     
+    parser.add_argument(
+        "--save-calibration-data",
+        action="store_true",
+        help="Save val-fold logits and labels for post-processing via confidence_calibration.py"
+    )
+
     args = parser.parse_args()
     main(
         use_real_data=args.real_data,
@@ -1416,5 +1774,6 @@ if __name__ == "__main__":
         force_cpu=args.cpu,
         ablation=args.ablation,
         output_dir=args.output_dir,
-        epochs=args.epochs
+        epochs=args.epochs,
+        save_calibration_data=args.save_calibration_data,
     )

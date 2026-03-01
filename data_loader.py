@@ -75,10 +75,10 @@ def load_processed_data(
     if max_stocks is not None and len(stock_dfs) > max_stocks:
         print(f"  Selecting top {max_stocks} stocks from {len(stock_dfs)} "
               f"by avg absolute returns (liquidity proxy, valid days only)...")
-        # FIX #6: Compute mean only over non-zero rows to avoid bias from
+        # Compute mean only over non-zero rows to avoid bias from
         # zero-padded days introduced by the union-index reindexing. Stocks
         # with shorter histories have more zero-padded days which would
-        # systematically lower their mean under the naive .mean() approach.
+        # systematically lower their mean under a naive .mean() approach.
         avg_abs_returns = []
         for df in stock_dfs:
             ret_col = df['Returns'] if 'Returns' in df.columns else df.iloc[:, -1]
@@ -161,7 +161,7 @@ def _build_inclusion_mask(
 
     True = ticker was an active S&P 500 constituent on that date.
 
-    FIX #7: Vectorized via pandas merge_asof instead of O(N×T) Python loop.
+    Vectorized via pandas merge_asof instead of O(N×T) Python loop.
     For a superset of 600 stocks × 4500 trading days this is ~100× faster.
 
     Falls back to all-True if historical CSV is not found (backward compat).
@@ -345,7 +345,7 @@ def create_backtest_folds(
     print(f"  Snapshot step size: {step_size} days")
     
     for fold in folds:
-        # FIX #1 & #2: Compute cross-sectional demean and rolling z-score per fold
+        # Per-fold cross-sectional demeaning and rolling z-score normalization
         start_t = max(0, fold.train_start - window_size)
         end_t = fold.val_end
         
@@ -449,12 +449,10 @@ def _create_snapshots(
         # stock_window[:, :, -1] (the Returns column) only reaches t+window_size-1 — no leakage.
         future_returns = returns_data[:, t+window_size:t+window_size+forecast_horizon].sum(dim=1)
 
-        # FIX #1: active_mask at the START of the forecast period (t + window_size),
+        # Active mask at the START of the forecast period (t + window_size),
         # not the last day of the lookback (t + window_size - 1).
         # Convention: mask[i]=True means stock i is a constituent when the
         # forecast period begins, i.e., it is legally tradable at that time.
-        # Using t+window_size-1 would include stocks removed on the boundary
-        # day and exclude stocks added on that day — the wrong semantics.
         clamp_t = min(t + window_size, inclusion_mask.size(1) - 1)
         active_mask = inclusion_mask[:, clamp_t]  # [N_s]
 
