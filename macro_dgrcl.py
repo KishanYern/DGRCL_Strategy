@@ -72,6 +72,81 @@ class HeteroGraphBuilder:
         self.sector_mask = sector_ids.unsqueeze(0) == sector_ids.unsqueeze(1)
         print(f"HeteroGraphBuilder: Precomputed sector mask for {N} stocks.")
 
+    def build_correlation_edges(
+        self,
+        return_series: torch.Tensor,   # [N_s, T] rolling returns from training window
+        active_mask: torch.Tensor,      # [N_s] bool
+        top_k: int = 15,
+        min_corr: float = 0.20,
+    ):
+        """
+        Compute top-K pairwise Pearson correlation edges from training-window returns.
+
+        Called once per fold on training-split returns (point-in-time safe). The
+        resulting edges are held fixed for all snapshots within the fold.
+        High-correlation pairs form the structural prior for the graph learner;
+        the model learns whether to upweight or downweight them via the attention
+        branch of DynamicGraphLearner.
+
+        Args:
+            return_series: [N_s, T] — daily log-returns over the training window
+            active_mask:   [N_s] bool — inactive/padded stocks are excluded
+            top_k:         Maximum neighbors to keep per node
+            min_corr:      Minimum |correlation| threshold to include an edge
+
+        Returns:
+            edge_index:  [2, E] long tensor (src, dst)
+            edge_weight: [E] float tensor of Pearson correlations in [-1, 1]
+        """
+        N_s = return_series.size(0)
+        device = return_series.device
+
+        # Restrict to active stocks only to avoid zero-padded rows
+        active_idx = active_mask.nonzero(as_tuple=True)[0]  # [n_active]
+        n_active = active_idx.numel()
+
+        if n_active < 2:
+            # Degenerate: return empty edge set
+            return (
+                torch.zeros(2, 0, dtype=torch.long, device=device),
+                torch.zeros(0, dtype=torch.float32, device=device),
+            )
+
+        ret_active = return_series[active_idx].float()  # [n_active, T]
+
+        # Mean-center each row for Pearson correlation
+        ret_c = ret_active - ret_active.mean(dim=1, keepdim=True)  # [n_active, T]
+        std = ret_c.norm(dim=1, keepdim=True).clamp(min=1e-8)      # [n_active, 1]
+        ret_norm = ret_c / std                                       # [n_active, T]
+
+        # Full pairwise correlation matrix [n_active, n_active]
+        corr_matrix = (ret_norm @ ret_norm.T) / ret_active.size(1)  # [n, n]
+
+        # Zero diagonal (self-loops not useful)
+        corr_matrix.fill_diagonal_(0.0)
+
+        # Top-K per row (absolute correlation)
+        k = min(top_k, n_active - 1)
+        abs_corr = corr_matrix.abs()
+        topk_vals, topk_local_idx = torch.topk(abs_corr, k=k, dim=1)  # [n, k]
+
+        # Apply minimum correlation threshold
+        valid = topk_vals >= min_corr  # [n, k]
+
+        # Build edges in the full-universe index space
+        row_local = torch.arange(n_active, device=device).unsqueeze(1).expand_as(topk_local_idx)
+        src_local = topk_local_idx[valid]  # neighbor (local index)
+        dst_local = row_local[valid]        # receiving node (local index)
+
+        # Map local active indices back to full universe indices
+        src_full = active_idx[src_local]
+        dst_full = active_idx[dst_local]
+
+        edge_index = torch.stack([src_full, dst_full], dim=0)  # [2, E]
+        edge_weight = corr_matrix[src_local, dst_local]        # raw Pearson in [-1,1]
+
+        return edge_index, edge_weight
+
     def build(
         self,
         stock_features: torch.Tensor,  # [N_s, T, d_s]
@@ -191,129 +266,164 @@ class TemporalEncoder(nn.Module):
 
 class DynamicGraphLearner(nn.Module):
     """
-    Computes dynamic adjacency matrix for Stock→Stock edges via attention.
-    
-    SECTOR-CONSTRAINED:
-    Applies a sector mask to attention scores so that stocks ONLY attend
-    to other stocks in the same sector.
+    Hybrid dynamic graph learner: correlation prior + multi-head GAT attention.
+
+    Combines two complementary signals:
+      1. Structural prior: pre-computed per-fold Pearson correlation edges
+         capture actual return co-movement independent of sector labels.
+      2. Learned attention: true multi-head GAT attention (concat [W·h_i || W·h_j]
+         per head, separate attention vector per head) learns which connections
+         are predictively useful beyond raw correlation.
+
+    The final edge weight is: softmax_per_node(α_attn + λ·corr_prior)
+    where λ is a learnable scalar initialized to 1.0. If no correlation prior
+    is provided the model falls back to pure attention.
+
+    Compared to the previous single-vector `a` design:
+      - Per-head projection avoids the bottleneck of a single attention direction
+      - Pre-normalized softmax output (rather than raw LeakyReLU scores) removes
+        the double-softmax issue in MacroPropagation
+      - Cross-sector edges allowed when correlation is high (sector mask moved
+        to be optional, not mandatory)
     """
-    
+
     def __init__(
         self,
         hidden_dim: int,
-        top_k: int = 10,
-        temperature: float = 1.0
+        top_k: int = 15,
+        num_heads: int = 4,
+        temperature: float = 1.0,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.top_k = top_k
+        self.num_heads = num_heads
         self.temperature = temperature
-        
-        # Learnable projection for attention
-        self.W = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.a = nn.Parameter(torch.randn(2 * hidden_dim))
-        
+        self.head_dim = max(hidden_dim // num_heads, 1)
+
+        # Per-head projections: W_k ∈ R^{H × head_dim}
+        self.W = nn.Linear(hidden_dim, num_heads * self.head_dim, bias=False)
+
+        # Per-head attention vectors: a_k ∈ R^{2*head_dim}
+        self.att = nn.Parameter(torch.empty(num_heads, 2 * self.head_dim))
+
+        # Learnable weight balancing attention vs. correlation prior
+        self.corr_lambda = nn.Parameter(torch.ones(1))
+
+        self.dropout = nn.Dropout(p=dropout)
         self._reset_parameters()
-    
+
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.W.weight)
-        # Use Xavier-scale std so attention scores have meaningful variance.
-        # std=0.01 on a 2H-dim vector produces near-zero dot products,
-        # collapsing all attention scores to ~0 (uniform attention).
-        nn.init.normal_(self.a, std=1.0 / (2 * self.W.in_features) ** 0.5)
-    
+        # Use Glorot-uniform for per-head attention vectors
+        nn.init.xavier_uniform_(self.att.unsqueeze(0))
+
     def forward(
         self,
-        embeddings: torch.Tensor,  # [N, H]
-        sector_mask: Optional[torch.Tensor] = None, # [N, N] bool
-        active_mask: Optional[torch.Tensor] = None,  # [N] bool
-        return_weights: bool = False
+        embeddings: torch.Tensor,           # [N, H]
+        sector_mask: Optional[torch.Tensor] = None,   # [N, N] bool — now optional
+        active_mask: Optional[torch.Tensor] = None,   # [N] bool
+        corr_edge_index: Optional[torch.Tensor] = None,  # [2, E_c] correlation prior edges
+        corr_edge_weight: Optional[torch.Tensor] = None,  # [E_c] Pearson weights
+        return_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Compute dynamic adjacency via attention.
-        
+        Compute dynamic adjacency combining correlation prior and GAT attention.
+
         Args:
-            embeddings: [N, H] node embeddings
-            sector_mask: [N, N] boolean mask (True = allowed edge)
-            return_weights: Whether to return attention weights
-            
+            embeddings:       [N, H] LSTM hidden states
+            sector_mask:      Optional [N, N] bool — if provided, restricts edges
+                              to same-sector pairs (used as a hard gate)
+            active_mask:      [N] bool — inactive stocks get no edges
+            corr_edge_index:  [2, E_c] pre-computed correlation edges (per fold)
+            corr_edge_weight: [E_c] Pearson correlations for prior edges
+            return_weights:   Whether to return pre-normalized edge weights
+
         Returns:
-            edge_index: [2, E] sparse edge indices (top-k per node)
-            edge_weight: [E] attention weights (if return_weights=True)
+            edge_index:  [2, E] sparse edge indices
+            edge_weight: [E] softmax-normalized weights in [0, 1] (or None)
         """
         N = embeddings.size(0)
-        
-        # Project embeddings
-        h = self.W(embeddings)  # [N, H]
-        
-        # Compute pairwise attention scores
-        # a^T [W h_i || W h_j] for all pairs
-        h_repeat = h.unsqueeze(1).repeat(1, N, 1)  # [N, N, H]
-        h_repeat_t = h.unsqueeze(0).repeat(N, 1, 1)  # [N, N, H]
-        
-        concat = torch.cat([h_repeat, h_repeat_t], dim=-1)  # [N, N, 2H]
-        attention = F.leaky_relu(torch.matmul(concat, self.a), negative_slope=0.2)  # [N, N]
-        attention = attention / self.temperature
-        
-        # --- COMBINE SECTOR MASK + ACTIVE MASK ---
-        # Build combined mask: both nodes must be active AND in same sector
-        combined_mask = None
-        if active_mask is not None:
-            # Pairwise active mask: both src and dst must be active
-            active_pairs = active_mask.unsqueeze(0) & active_mask.unsqueeze(1)  # [N, N]
-            combined_mask = active_pairs
-        
-        if sector_mask is not None:
-            if sector_mask.shape != attention.shape:
-               raise ValueError(f"Sector mask shape {sector_mask.shape} mismatch with attention {attention.shape}")
-            if combined_mask is not None:
-                combined_mask = combined_mask & sector_mask
-            else:
-                combined_mask = sector_mask
-        
-        if combined_mask is not None:
-            # Mask out invalid pairs with -inf.
-            # float('-inf') is safe for all dtypes (FP16/FP32/BF16) and
-            # guarantees isfinite() cleanly separates valid from masked edges.
-            attention = attention.masked_fill(~combined_mask, float('-inf'))
+        device = embeddings.device
 
-        # Top-k selection per row (each node keeps top-k neighbors)
+        # Project and reshape: [N, num_heads, head_dim]
+        h = self.W(embeddings).view(N, self.num_heads, self.head_dim)
+
+        # --- Build candidate edge set ---
+        # Start with correlation prior edges (cross-sector allowed)
+        if corr_edge_index is not None and corr_edge_index.size(1) > 0:
+            src_c, dst_c = corr_edge_index
+            # Augment with full top_k attention-only edges for remaining pairs
+            # Strategy: compute full attention matrix, take top_k per node,
+            # then union with correlation edges
+            use_corr = True
+        else:
+            use_corr = False
+
+        # Compute full pairwise GAT attention scores [N, N]
+        # a_k^T [W_k·h_i || W_k·h_j]  averaged across heads
+        h_i = h.unsqueeze(1).expand(N, N, self.num_heads, self.head_dim)  # [N, N, H, D]
+        h_j = h.unsqueeze(0).expand(N, N, self.num_heads, self.head_dim)  # [N, N, H, D]
+        concat = torch.cat([h_i, h_j], dim=-1)  # [N, N, H, 2D]
+
+        # self.att: [H, 2D] -> broadcast over [N, N, H, 2D] -> [N, N, H]
+        attn_scores = (concat * self.att.unsqueeze(0).unsqueeze(0)).sum(-1)  # [N, N, H]
+        attn_scores = F.leaky_relu(attn_scores, negative_slope=0.2)
+        attn_scores = attn_scores.mean(dim=-1) / self.temperature  # [N, N] mean over heads
+
+        # --- Apply masks ---
+        # Combined mask: both nodes must be active
+        combined_mask = torch.ones(N, N, dtype=torch.bool, device=device)
+        if active_mask is not None:
+            active_pairs = active_mask.unsqueeze(0) & active_mask.unsqueeze(1)
+            combined_mask = combined_mask & active_pairs
+        if sector_mask is not None:
+            # Sector mask now optional: only apply if explicitly passed
+            combined_mask = combined_mask & sector_mask.to(device)
+
+        attn_scores = attn_scores.masked_fill(~combined_mask, float('-inf'))
+
+        # --- Add correlation prior to attention scores ---
+        if use_corr:
+            # Scatter corr weights into a dense [N, N] prior matrix
+            corr_matrix = torch.zeros(N, N, device=device)
+            src_c_dev = corr_edge_index[0].to(device)
+            dst_c_dev = corr_edge_index[1].to(device)
+            w_dev = corr_edge_weight.to(device).float()
+            corr_matrix[src_c_dev, dst_c_dev] = w_dev
+            # Only add prior where edges are valid (mask-consistent)
+            corr_matrix = corr_matrix * combined_mask.float()
+            attn_scores = attn_scores + self.corr_lambda * corr_matrix
+        else:
+            # No correlation prior: add zero contribution so corr_lambda always
+            # participates in the computation graph and receives gradients.
+            attn_scores = attn_scores + self.corr_lambda * 0.0
+
+        # --- Top-k selection per node ---
         k = min(self.top_k, N - 1)
-        topk_values, topk_indices = torch.topk(attention, k=k, dim=1)  # [N, k]
-        
-        # Filter out masked edges (those filled with -inf above).
-        # isfinite() is dtype-agnostic and correctly identifies -inf in FP16/FP32/BF16.
-        valid_mask = torch.isfinite(topk_values)  # [N, k]
-        
-        # Build sparse edge_index
-        # CRITICAL: In PyG MessagePassing, info flows src → dst
-        # Node i computed which neighbors j are relevant, so i should RECEIVE from j
-        # Therefore edges are: src=j (neighbors), dst=i (computing node)
-        
-        # Create row indices [N, k]
-        row_indices = torch.arange(N, device=embeddings.device).unsqueeze(1).repeat(1, k)  # [N, k]
-        
-        # Apply filter
-        src_indices = topk_indices[valid_mask]  # neighbors j (flattened)
-        dst_indices = row_indices[valid_mask]   # node i (flattened)
-        
-        # Edges: j → i
-        edge_index = torch.stack([src_indices, dst_indices], dim=0)  # [2, E_valid]
-        
+        topk_scores, topk_idx = torch.topk(attn_scores, k=k, dim=1)  # [N, k]
+
+        # Filter truly invalid edges (-inf from masking)
+        valid = torch.isfinite(topk_scores)  # [N, k]
+
+        row_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, k)  # [N, k]
+        src_idx = topk_idx[valid]   # neighbor j
+        dst_idx = row_idx[valid]    # receiving node i
+
+        edge_index = torch.stack([src_idx, dst_idx], dim=0)  # [2, E]
+
         if return_weights:
-            # Normalize weights via softmax over selected neighbors (subset)
-            # We need to re-softmax only over valid edges per node?
-            # Actually, the original softmax was over all N. 
-            # But usually we softmax over the selected neighbors for GAT-style.
-            # Here we just return the raw attention scores (passed through leaky_relu/temp)
-            # The downstream layer applies softmax.
-            
-            # Extract valid values
-            edge_weight = topk_values[valid_mask]
-            
-            # NOTE: The downstream MacroPropagation layer calls softmax(alpha, dst, ...)
-            # So passing raw scores is correct.
+            # Pre-normalize with softmax PER destination node so downstream
+            # MacroPropagation can use weights directly without re-softmax.
+            # We compute a per-node softmax over selected neighbors.
+            raw = topk_scores.clone()
+            raw[~valid] = float('-inf')
+            # Softmax over k dimension (per row = per receiving node)
+            normalized = torch.softmax(raw, dim=1)  # [N, k]
+            edge_weight = normalized[valid]  # [E] in [0, 1], sums to 1 per node
+            edge_weight = self.dropout(edge_weight)
             return edge_index, edge_weight
-        
+
         return edge_index, None
 
 
@@ -355,10 +465,11 @@ class MacroPropagation(MessagePassing):
         # Separate transformations for stock and macro
         self.W_stock = nn.Linear(stock_dim, heads * out_dim, bias=False)
         self.W_macro = nn.Linear(macro_dim, heads * out_dim, bias=False)
-        
-        # Attention parameters for stock-stock
-        self.att_stock = nn.Parameter(torch.randn(1, heads, 2 * out_dim))
-        
+
+        # att_stock removed: DynamicGraphLearner now always returns pre-normalized
+        # per-edge weights (softmax over selected neighbors). _aggregate_stock uses
+        # those weights directly and no longer needs an in-layer attention vector.
+
         # Attention parameters for macro-stock
         self.att_macro = nn.Parameter(torch.randn(1, heads, 2 * out_dim))
         
@@ -370,7 +481,6 @@ class MacroPropagation(MessagePassing):
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.W_stock.weight)
         nn.init.xavier_uniform_(self.W_macro.weight)
-        nn.init.xavier_uniform_(self.att_stock)
         nn.init.xavier_uniform_(self.att_macro)
         nn.init.xavier_uniform_(self.out_proj.weight)
     
@@ -422,36 +532,29 @@ class MacroPropagation(MessagePassing):
     
     def _aggregate_stock(
         self,
-        h: torch.Tensor,  # [N_s, H, D]
+        h: torch.Tensor,           # [N_s, H, D]
         edge_index: torch.Tensor,
         edge_weight: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        """Aggregate messages from stock neighbors."""
+        """Aggregate messages from stock neighbors using pre-normalized edge weights.
+
+        DynamicGraphLearner always returns softmax-normalized per-edge weights
+        (one probability distribution per destination node). We apply them directly
+        as a weighted sum over neighbor embeddings — no redundant in-layer softmax.
+        """
         src, dst = edge_index
-        
-        # Compute attention
-        h_i = h[dst]  # [E, H, D]
         h_j = h[src]  # [E, H, D]
-        
-        concat = torch.cat([h_i, h_j], dim=-1)  # [E, H, 2D]
-        alpha = (concat * self.att_stock).sum(dim=-1)  # [E, H]
-        alpha = F.leaky_relu(alpha, negative_slope=self.negative_slope)
-        
-        # Normalize via softmax over incoming edges
-        alpha = softmax(alpha, dst, num_nodes=h.size(0))  # [E, H]
-        # NaN-safe: fully inactive nodes have all-(-inf) inputs → NaN after softmax
-        alpha = torch.nan_to_num(alpha, nan=0.0)
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-        
-        # Incorporate precomputed edge weights if available
+
         if edge_weight is not None:
-            alpha = alpha * edge_weight.unsqueeze(-1)  # [E, H]
-        
-        # Aggregate
-        out = h_j * alpha.unsqueeze(-1)  # [E, H, D]
-        # Use matching dtype for scatter_add_ (autocast may mix FP16/FP32)
-        out = torch.zeros(h.shape, dtype=out.dtype, device=h.device).scatter_add_(0, dst.view(-1, 1, 1).expand_as(out), out)
-        
+            # Pre-normalized weights from DynamicGraphLearner
+            w = edge_weight.view(-1, 1, 1).to(h.dtype)  # [E, 1, 1]
+            out_msgs = h_j * w
+        else:
+            # Fallback: uniform aggregation (no edge_weight provided)
+            out_msgs = h_j
+
+        out = torch.zeros(h.shape, dtype=out_msgs.dtype, device=h.device)
+        out.scatter_add_(0, dst.view(-1, 1, 1).expand_as(out_msgs), out_msgs)
         return out
     
     def _aggregate_macro(
@@ -610,10 +713,12 @@ class MacroDGRCL(nn.Module):
         self.stock_embedding_norm = nn.LayerNorm(hidden_dim)
         self.macro_embedding_norm = nn.LayerNorm(hidden_dim)
         
-        # Dynamic Graph Learner
+        # Dynamic Graph Learner (upgraded: multi-head GAT + correlation prior)
         self.graph_learner = DynamicGraphLearner(
             hidden_dim=hidden_dim,
-            top_k=top_k
+            top_k=top_k,
+            num_heads=heads,
+            dropout=dropout,
         )
         
         # Message Passing Layers
@@ -647,18 +752,26 @@ class MacroDGRCL(nn.Module):
         stock_features: torch.Tensor,  # [N_s, T, d_s]
         macro_features: torch.Tensor,  # [N_m, T, d_m]
         macro_stock_edges: Optional[torch.Tensor] = None,  # [2, E_ms]
-        sector_mask: Optional[torch.Tensor] = None, # [N_s, N_s] boolean mask
-        active_mask: Optional[torch.Tensor] = None  # [N_s] boolean mask
+        sector_mask: Optional[torch.Tensor] = None,        # [N_s, N_s] boolean mask
+        active_mask: Optional[torch.Tensor] = None,        # [N_s] boolean mask
+        corr_edge_index: Optional[torch.Tensor] = None,   # [2, E_c] per-fold correlation edges
+        corr_edge_weight: Optional[torch.Tensor] = None,  # [E_c] Pearson weights
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through GNN backbone and Multi-Task head.
-        
+
         Args:
-            stock_features: [N_s, T, d_s] stock time-series
-            macro_features: [N_m, T, d_m] macro time-series
+            stock_features:   [N_s, T, d_s] stock time-series
+            macro_features:   [N_m, T, d_m] macro time-series
             macro_stock_edges: [2, E_ms] macro→stock edge index
-            sector_mask: [N_s, N_s] boolean mask for sector constraints
-            
+            sector_mask:      Optional [N_s, N_s] boolean mask — when provided,
+                              restricts learned edges to within-sector pairs.
+                              Leave None to allow cross-sector edges (recommended
+                              when correlation prior is active).
+            active_mask:      [N_s] bool — inactive padded stocks
+            corr_edge_index:  [2, E_c] pre-computed correlation edges (per fold)
+            corr_edge_weight: [E_c] Pearson correlations for structural prior edges
+
         Returns:
             direction_logits: [N_s, 1] unbounded logits for P(return > median)
             magnitude_preds:  [N_s, 1] predicted |R_t| (non-negative)
@@ -683,11 +796,14 @@ class MacroDGRCL(nn.Module):
             stock_h = stock_h * active_mask.unsqueeze(-1).float()
         
         # 2. Dynamic Graph Learning (Stock→Stock)
-        # SAFEGUARD 2: Pass active_mask to sever inactive nodes via -inf masking
+        # Pass correlation prior edges; sector_mask is now optional (pass None to
+        # allow cross-sector edges when correlation prior is active).
         stock_stock_edges, edge_weights = self.graph_learner(
-            stock_h, 
-            sector_mask=sector_mask,
+            stock_h,
+            sector_mask=sector_mask,    # None when using correlation-based adjacency
             active_mask=active_mask,
+            corr_edge_index=corr_edge_index,
+            corr_edge_weight=corr_edge_weight,
             return_weights=True
         )
         

@@ -79,7 +79,21 @@ python3 confidence_calibration.py --results-dir ./backtest_results
 bash run_gpu_training.sh --real-data --start-fold 1 --end-fold 10
 ```
 
-### CLI Reference
+### Running the Benchmark Suite
+Requires a completed DGRCL backtest (`backtest_results/fold_results.json` must exist).
+
+```bash
+# Full benchmark run (all 7 models, 90 folds):
+python run_benchmarks.py --real-data
+
+# Classical factors only — no GPU required, runs in seconds:
+python run_benchmarks.py --real-data --skip-trainable
+
+# Smoke test (fold 1, synthetic data):
+python run_benchmarks.py --fast --synthetic
+```
+
+### CLI Reference — `train.py`
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -93,11 +107,25 @@ bash run_gpu_training.sh --real-data --start-fold 1 --end-fold 10
 | `--cpu` | — | Force CPU training |
 | `--ablation` | `baseline` | Feature ablation variant |
 
+### CLI Reference — `run_benchmarks.py`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--real-data` | — | Use real market data |
+| `--synthetic` | — | Use synthetic data (overrides `--real-data`, for smoke testing) |
+| `--fast` | — | Run only fold 1 |
+| `--cpu` | — | Force CPU mode |
+| `--benchmarks` | all | Subset of benchmarks to run (choices: `random prior_day_persistence momentum_12_1 short_term_reversal low_volatility lstm_only lgbm_ranker`) |
+| `--skip-trainable` | — | Skip LSTM and LightGBM (Tier 1 + 2 only) |
+| `--skip-ff3` | — | Skip Fama-French download (offline use) |
+| `--dgrcl-results` | `./backtest_results/fold_results.json` | Path to DGRCL results for comparison |
+| `--output-dir` | `./backtest_results/benchmarks` | Output directory |
+
 ---
 
 ## 4. Output Files
 
-After a full run, `backtest_results/` will contain:
+After a full DGRCL run, `backtest_results/` will contain:
 
 | File | Description |
 |------|-------------|
@@ -111,6 +139,14 @@ After a full run, `backtest_results/` will contain:
 | `conformal_predictor.json` | q_hat threshold + α |
 | `reliability_diagram_before.png` | Calibration plot (raw) |
 | `reliability_diagram_after_temp.png` | Calibration plot (post-temperature) |
+
+After a benchmark run, `backtest_results/benchmarks/` will contain:
+
+| File | Description |
+|------|-------------|
+| `benchmark_comparison.png` | 6-panel comparison plot |
+| `ff3_attribution.json` | Fama-French 3-factor regression results |
+| `{model}_fold_results.json` | Per-fold metrics for each benchmark model |
 
 ---
 

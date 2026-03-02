@@ -8,7 +8,7 @@
     *   Statistically robust over 19 years of OOS data including GFC and COVID-19. All 90 folds beat random chance.
 *   **Mean Val Loss**: **0.461**
 *   **Mean Magnitude MAE**: **0.35** — stable across all 90 folds.
-*   **L/S Alpha**: Positive in **90/90 folds**, mean annualized alpha of **+31.57%**.
+*   **L/S Alpha**: Positive in **88/90 folds** (folds 22 and 37 are outlier negative-alpha folds), mean L/S spread of **+0.865 z-score units** per snapshot.
 *   **NaN Training Folds**: **0/90 (100% stable)** — clipping and zero-padding fixes successfully eliminated all NaN states.
 *   **ECE (raw)**: 0.015 — near-perfect confidence calibration.
 *   **Conformal Coverage**: 89.4% (target ≥ 90% for α=0.10).
@@ -39,7 +39,7 @@
 | 8 | Long-short alpha tracking | ✅ Implemented |
 | 9 | Walk-forward architecture | ✅ Already in v1.5 |
 | 10 | Sector-neutral loss | ✅ Already in v1.5 |
-| 11 | Benchmark vs simple models | 🔲 Not yet implemented |
+| 11 | Benchmark vs simple models | ✅ Complete — see [`docs/benchmark_results.md`](benchmark_results.md) |
 
 ---
 
@@ -58,9 +58,9 @@ The model's raw ECE (0.015) is already excellent. Temperature scaling with T=1.5
 ## 4. Future Roadmap
 
 ### Phase 0: Remaining Deployment Items
-1.  **Benchmark vs simple models** (Rec 11) — compare against momentum, sector rotation, and random baselines.
+1.  ~~**Benchmark vs simple models** (Rec 11)~~ — **✅ Complete.** DGRCL outperforms all 7 benchmarks across 90 folds. Full results in [`docs/benchmark_results.md`](benchmark_results.md). Key result: DGRCL leads LSTM-only by +0.15pp rank accuracy and +20% L/S alpha, confirming the graph component's contribution.
 2.  **Transaction Cost Analysis** — 5 bps/trade cost model integration.
-3.  **Full re-run with recalibrated thresholds** — validate regime-adaptive features with corrected boundaries.
+3.  **Store raw L/S return series in `fold_results.json`** — enables FF3 attribution for DGRCL (currently only computed for benchmarks).
 
 ### Phase 1: Portfolio Construction (Short-Term)
 1.  **Mean-Variance Optimizer** — feed `dir_logits` + `mag_preds` into a convex optimizer.

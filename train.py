@@ -246,6 +246,8 @@ def train_step(
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None,
     active_mask: Optional[torch.Tensor] = None,
+    corr_edge_index: Optional[torch.Tensor] = None,
+    corr_edge_weight: Optional[torch.Tensor] = None,
     max_grad_norm: float = 0.5,
     scaler=None,  # torch.amp.GradScaler (type omitted for AMP API compatibility)
     accumulation_steps: int = 4,
@@ -290,8 +292,10 @@ def train_step(
             stock_features=stock_features,
             macro_features=macro_features,
             macro_stock_edges=macro_stock_edges,
-            sector_mask=sector_mask,
-            active_mask=active_mask
+            sector_mask=None,       # Sector constraint removed from graph; kept in loss
+            active_mask=active_mask,
+            corr_edge_index=corr_edge_index,
+            corr_edge_weight=corr_edge_weight,
         )
         
         scores = dir_logits.squeeze(-1)  # [N_s]
@@ -386,6 +390,8 @@ def train_epoch(
     max_grad_norm: float = 0.5,
     sector_mask: Optional[torch.Tensor] = None,
     sector_ids: Optional[torch.Tensor] = None,
+    corr_edge_index: Optional[torch.Tensor] = None,
+    corr_edge_weight: Optional[torch.Tensor] = None,
     scaler=None,  # torch.amp.GradScaler instance
     accumulation_steps: int = 4
 ) -> Dict[str, float]:
@@ -446,6 +452,8 @@ def train_epoch(
             sector_mask=sector_mask,
             sector_ids=sector_ids,
             active_mask=active_mask,
+            corr_edge_index=corr_edge_index,
+            corr_edge_weight=corr_edge_weight,
             scaler=scaler,
             accumulation_steps=accumulation_steps,
             batch_idx=num_batches
@@ -479,7 +487,9 @@ def evaluate(
     device: torch.device,
     mag_weight: float = 0.05,
     sector_mask: Optional[torch.Tensor] = None,
-    sector_ids: Optional[torch.Tensor] = None
+    sector_ids: Optional[torch.Tensor] = None,
+    corr_edge_index: Optional[torch.Tensor] = None,
+    corr_edge_weight: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """
     Evaluate model on validation data with pairwise ranking + magnitude metrics.
@@ -507,13 +517,14 @@ def evaluate(
         macro_feat = macro_feat.to(device)
         returns = returns.to(device)
         
-        # Forward pass with mixed precision
         with torch.amp.autocast('cuda', enabled=stock_feat.is_cuda):
             dir_logits, mag_preds = model(
                 stock_features=stock_feat,
                 macro_features=macro_feat,
-                sector_mask=sector_mask,
-                active_mask=active_mask
+                sector_mask=None,
+                active_mask=active_mask,
+                corr_edge_index=corr_edge_index,
+                corr_edge_weight=corr_edge_weight,
             )
         
         scores = dir_logits.squeeze(-1)
@@ -1285,6 +1296,8 @@ def main(
     else:
         print("Mixed Precision Training (FP16): DISABLED")
     
+    graph_builder = None
+
     if use_real_data:
         from data_loader import load_and_prepare_backtest
         
@@ -1465,6 +1478,35 @@ def main(
               f"Realized vol: {realized_vol:.4f} | "
               f"Adaptive λ: {adaptive_mag_weight:.4f}")
 
+        # Compute per-fold correlation edges from the training window.
+        # Uses the Returns column (index -1) of the last training snapshot batch.
+        # Held fixed for all snapshots in this fold (point-in-time safe).
+        corr_edge_index, corr_edge_weight = None, None
+        if graph_builder is not None:
+            # Collect return time-series across training snapshots: [N_s, n_train]
+            train_returns = torch.stack(
+                [
+                    snap[2] if len(snap) == 3 else snap[2]  # returns tensor
+                    for snap in train_data
+                ],
+                dim=1   # [N_s, n_train]
+            )
+            # Use active_mask from the last training snapshot
+            last_snap = train_data[-1]
+            fold_active = last_snap[3] if len(last_snap) == 4 else torch.ones(
+                train_returns.size(0), dtype=torch.bool
+            )
+            corr_edge_index, corr_edge_weight = graph_builder.build_correlation_edges(
+                return_series=train_returns.to('cpu'),
+                active_mask=fold_active.to('cpu'),
+                top_k=min(15, NUM_STOCKS - 1),
+                min_corr=0.20,
+            )
+            corr_edge_index = corr_edge_index.to(device)
+            corr_edge_weight = corr_edge_weight.to(device)
+            print(f"  Correlation edges: {corr_edge_index.size(1)} "
+                  f"(top-15 per stock, min |corr|=0.20)")
+
         # Adjust early stopping patience based on regime volatility
         early_stopping = EarlyStopping(base_patience=PATIENCE, max_patience=PATIENCE * 2)
         early_stopping.update_patience(realized_vol, high_vol_threshold=0.50)
@@ -1483,6 +1525,8 @@ def main(
                 max_grad_norm=0.5,
                 sector_mask=sector_mask,
                 sector_ids=sector_ids,
+                corr_edge_index=corr_edge_index,
+                corr_edge_weight=corr_edge_weight,
                 scaler=scaler
             )
             epoch_losses.append(epoch_metrics['loss'])
@@ -1506,7 +1550,9 @@ def main(
                     device=device,
                     mag_weight=mag_weight,
                     sector_mask=sector_mask,
-                    sector_ids=sector_ids
+                    sector_ids=sector_ids,
+                    corr_edge_index=corr_edge_index,
+                    corr_edge_weight=corr_edge_weight,
                 )
                 if early_stopping(val_metrics['loss'], model):
                     print(f"  Early stopping at epoch {epoch+1} "
@@ -1532,7 +1578,9 @@ def main(
                 device=device,
                 mag_weight=mag_weight,
                 sector_mask=sector_mask,
-                sector_ids=sector_ids
+                sector_ids=sector_ids,
+                corr_edge_index=corr_edge_index,
+                corr_edge_weight=corr_edge_weight,
             )
             print(f"  Val Loss: {val_metrics['loss']:.4f} "
                   f"(Dir: {val_metrics['loss_dir']:.4f}, Mag: {val_metrics['loss_mag']:.4f})")

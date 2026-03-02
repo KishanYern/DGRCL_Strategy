@@ -91,3 +91,43 @@ bash run_gpu_training.sh --real-data --save-calibration-data
 python3 train.py --real-data --save-calibration-data
 python3 confidence_calibration.py --results-dir ./backtest_results
 ```
+
+---
+
+## 7. Benchmark Comparison
+
+After training, run the benchmark suite to compare DGRCL against a tiered set of baseline models on the same 90 folds:
+
+```bash
+# Full run — all 7 models (includes LSTM-Only and LightGBM training per fold):
+python run_benchmarks.py --real-data
+
+# Classical factors only — fast, no GPU required:
+python run_benchmarks.py --real-data --skip-trainable
+
+# Skip FF3 download (offline environments):
+python run_benchmarks.py --real-data --skip-ff3
+```
+
+### Benchmark Tiers
+
+| Tier | Models | Purpose |
+|------|--------|---------|
+| Tier 1 — Null | Random, Prior-Day Persistence | Floor; confirms framework is unbiased |
+| Tier 2 — Classical | Momentum 12-1M, Short-Term Reversal, Low Volatility | Rules-based factor benchmarks |
+| Tier 3 — ML Ablations | LSTM-Only (No Graph), LightGBM LambdaRank | Isolate contribution of graph/macro architecture |
+
+### v1.6 Benchmark Results Summary
+
+| Model | Rank Accuracy | L/S Spread (z) | FF3 α | FF3 t-stat |
+|-------|:---:|:---:|:---:|:---:|
+| **DGRCL v1.6** | **57.56%** | **+0.865** | — | — |
+| LSTM-Only | 57.41% | +0.719 | +0.720 | +15.5 |
+| LightGBM | 56.52% | +0.792 | +0.792 | +11.9 |
+| Prior-Day Persistence | 50.37% | +0.004 | -0.004 | -0.07 |
+| Random | 50.00% | -0.063 | — | — |
+| Short-Term Reversal | 49.25% | +0.042 | -0.082 | -1.41 |
+| Low Volatility | 48.60% | -0.225 | -0.225 | -3.39 |
+| Momentum 12-1M | **46.41%** | **-0.384** | **-0.395** | **-6.41** |
+
+Full benchmark analysis, per-regime breakdowns, and artifact paths: see [`docs/benchmark_results.md`](benchmark_results.md).
