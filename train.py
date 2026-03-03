@@ -1422,6 +1422,8 @@ def main(
     save_calibration_data: bool = False,
     portfolio_method: str = "naive",
     portfolio_gamma: float = 1.0,
+    save_checkpoint: bool = False,
+    checkpoint_dir: str = "./checkpoints",
 ):
     """
     Training loop with Multi-Task Learning.
@@ -2012,7 +2014,122 @@ def main(
         )
     else:
         print("\nNo model trained (all folds skipped). Skipping inference.")
-    
+
+    # --- Save inference checkpoint (--save-checkpoint) ---
+    if save_checkpoint and 'model' in locals():
+        from checkpoint import CheckpointManager
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        ckpt_path = os.path.join(checkpoint_dir, "latest.pt")
+        mgr = CheckpointManager(ckpt_path)
+
+        model_config = {
+            "num_stocks": NUM_STOCKS,
+            "num_macros": NUM_MACROS,
+            "stock_feature_dim": STOCK_DIM,
+            "macro_feature_dim": MACRO_DIM,
+            "hidden_dim": HIDDEN_DIM,
+            "temporal_layers": 2,
+            "mp_layers": 2,
+            "heads": 4,
+            "top_k": min(5, NUM_STOCKS - 1),
+            "dropout": 0.5,
+            "head_dropout": 0.5,
+        }
+
+        # Extract conformal gate state and covariance from the last portfolio constructor
+        # (port_metrics dict holds the last fold's constructor state indirectly; we
+        # reconstruct it here from the last fold data).
+        conf_q_hat = None
+        conf_calibrated = False
+        cov_sigma = None
+        if use_real_data:
+            # Re-run a lightweight conformal calibration on the last fold's val data
+            # to embed a calibrated gate in the checkpoint.
+            try:
+                from portfolio_optimizer import PortfolioConstructor
+                import numpy as _np
+                last_fold_result = all_fold_results[-1]
+                constructor_ckpt = PortfolioConstructor(
+                    method=portfolio_method,
+                    gamma=portfolio_gamma,
+                    use_conformal_gate=True,
+                    alpha=0.10,
+                )
+                # Fit covariance from last training window
+                train_rets_last = torch.stack(
+                    [snap[2] for snap in train_data], dim=1
+                )
+                last_active = train_data[-1][3] if len(train_data[-1]) == 4 else None
+                active_np_last = last_active.cpu().numpy() if last_active is not None else None
+                constructor_ckpt.fit_covariance(train_rets_last.cpu().numpy(), active_np_last)
+                cov_sigma = constructor_ckpt._cov_estimator.sigma
+
+                # Calibrate gate on last fold val data
+                cal_logits_list, cal_labels_list = [], []
+                model.eval()
+                with torch.no_grad():
+                    cal_end = max(1, len(val_data) // 2)
+                    for snap in val_data[:cal_end]:
+                        sf, mf, rets = snap[:3]
+                        am = snap[3].to(device) if len(snap) == 4 else None
+                        sf, mf = sf.to(device), mf.to(device)
+                        logits_s, _ = model(
+                            stock_features=sf, macro_features=mf,
+                            active_mask=am,
+                            corr_edge_index=corr_edge_index,
+                            corr_edge_weight=corr_edge_weight,
+                        )
+                        ln = logits_s.squeeze(-1).cpu().numpy()
+                        rn = rets.cpu().numpy()
+                        mask_n = am.cpu().numpy().astype(bool) if am is not None else _np.ones(len(ln), dtype=bool)
+                        cal_logits_list.extend(ln[mask_n].tolist())
+                        cal_labels_list.extend((rn[mask_n] > 0).astype(float).tolist())
+
+                if len(cal_logits_list) > 10:
+                    constructor_ckpt.fit_conformal(
+                        _np.array(cal_logits_list, dtype=_np.float32),
+                        _np.array(cal_labels_list, dtype=_np.float32),
+                    )
+                    gate = constructor_ckpt._gate
+                    if gate is not None and gate._calibrated:
+                        conf_q_hat = float(gate._predictor._q_hat) if hasattr(gate._predictor, '_q_hat') else None
+                        conf_calibrated = True
+            except Exception as _e:
+                print(f"  Warning: could not embed calibration in checkpoint: {_e}")
+
+        last_regime = all_fold_results[-1].get('regime') if all_fold_results else None
+        last_vol = all_fold_results[-1].get('realized_vol') if all_fold_results else None
+        last_fold_num = all_fold_results[-1].get('fold') if all_fold_results else None
+        train_end_str = str(dates[folds[-1].val_end - 1].date()) if (use_real_data and folds) else None
+
+        metadata = {
+            "tickers": tickers if use_real_data else [],
+            "sector_ids": sector_ids.cpu().numpy() if (use_real_data and sector_ids is not None) else None,
+            "feature_indices": feature_indices,
+            "feature_names": selected_names,
+            "fold_index": last_fold_num,
+            "train_end_date": train_end_str,
+            "regime": last_regime,
+            "realized_vol": last_vol,
+            "portfolio_method": portfolio_method,
+            "portfolio_gamma": portfolio_gamma,
+        }
+
+        mgr.save(
+            model=model,
+            model_config=model_config,
+            metadata=metadata,
+            conformal_q_hat=conf_q_hat,
+            conformal_alpha=0.10,
+            conformal_calibrated=conf_calibrated,
+            covariance_sigma=cov_sigma,
+            corr_edge_index=corr_edge_index,
+            corr_edge_weight=corr_edge_weight,
+        )
+        print(f"  Inference checkpoint saved to: {ckpt_path}")
+        print(f"  Conformal gate calibrated: {conf_calibrated}")
+        print(f"  Covariance embedded: {cov_sigma is not None}")
+
     print(f"\nBacktest complete! Results saved to: {VIS_DIR}")
     return all_fold_results
 
@@ -2100,6 +2217,19 @@ if __name__ == "__main__":
         help="Risk aversion coefficient for MVO portfolio (default: 1.0, higher = more conservative)"
     )
 
+    parser.add_argument(
+        "--save-checkpoint",
+        action="store_true",
+        help="Save an inference checkpoint bundle (.pt) after training for use in live trading"
+    )
+
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="./checkpoints",
+        help="Directory to save inference checkpoint (default: ./checkpoints)"
+    )
+
     args = parser.parse_args()
     main(
         use_real_data=args.real_data,
@@ -2113,4 +2243,6 @@ if __name__ == "__main__":
         save_calibration_data=args.save_calibration_data,
         portfolio_method=args.portfolio_method,
         portfolio_gamma=args.portfolio_gamma,
+        save_checkpoint=args.save_checkpoint,
+        checkpoint_dir=args.checkpoint_dir,
     )
