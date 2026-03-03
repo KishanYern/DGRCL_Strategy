@@ -1,5 +1,5 @@
-# Backtest Findings & Next Steps (v1.6 — 90-Fold Run)
-*Run date: 2026-03-01 | Period: 2007-01-25 → 2026-02-20 | 4,799 trading days*
+# Backtest Findings & Next Steps (v1.7 — Phase 1 Portfolio Construction)
+*Run date: 2026-03-03 | Period: 2007-01-25 → 2026-02-20 | 4,799 trading days*
 
 ---
 
@@ -73,24 +73,97 @@ Full benchmark analysis: see [`docs/benchmark_results.md`](benchmark_results.md)
 
 ---
 
+## Phase 1: Portfolio Construction Results (v1.7)
+
+Phase 1 replaced the naive sector L/S baseline with optimized portfolio weights. All three items are complete. Implementation: `portfolio_optimizer.py`, integrated into `train.py` via `compute_optimized_alpha()`.
+
+### Components Implemented
+
+| Component | Module | Description |
+|---|---|---|
+| **Conformal Abstention Gate** | `ConformalGate` | Per-fold calibration; trades only `set_size == 1`. Includes `min_tradable=20` guard to prevent over-gating. |
+| **Expected Return Estimator** | `ExpectedReturnEstimator` | μ = (2·P_up − 1) · \|mag_preds\|, where P_up = σ(dir_logits). |
+| **Covariance Estimator** | `CovarianceEstimator` | Ledoit-Wolf shrinkage per fold. PSD-floored with ε=1e-4. |
+| **Mean-Variance Optimizer** | `MeanVarianceOptimizer` | Markowitz via cvxpy (CLARABEL solver). Dollar-neutral, leverage ≤ 2.0, adaptive position caps. |
+| **Risk Parity Optimizer** | `RiskParityOptimizer` | ERC across spectral clusters from attention adjacency. L-BFGS-B with softmax parameterization. |
+| **Transaction Cost Model** | `compute_portfolio_metrics` | 5 bps/trade applied to all turnover. Reports gross and net Sharpe/PnL/MaxDD. |
+
+### Three-Way Comparison (90 Folds)
+
+| Metric | MVO v1 | MVO v2 (production) | Risk Parity |
+|---|:---:|:---:|:---:|
+| **Sharpe (gross)** | 4.95 ± 4.27 | 4.81 ± 4.22 | 3.37 ± 4.71 |
+| **Sharpe (net, 5bps)** | — | 4.81 ± 4.22 | 3.36 ± 4.71 |
+| **Total PnL (gross)** | 314.7 | 274.5 | 425.8 |
+| **Avg Turnover** | 0.334 | 0.267 | 1.064 |
+| **Avg MaxDD** | 0.652 | **0.244** | 1.441 |
+| **Worst MaxDD** | 14.46 | **1.72** | 7.39 |
+| **High-DD folds (>1.0)** | 11/90 | **4/90** | 46/90 |
+| **Win rate (Sharpe > 0)** | 88.9% | 85.6% | 74.4% |
+| **Calmar (PnL / Worst DD)** | 21.8 | **159.5** | 57.6 |
+| **Sharpe / Turnover** | 14.8 | **18.1** | 3.2 |
+| **Avg Gated %** | 69.6% | 69.9% | 69.3% |
+| **Total TCA Cost** | — | 0.23 | 0.86 |
+
+### MVO v1 → v2 Improvement (Key Fixes)
+
+Three changes were applied between MVO v1 and v2:
+
+1. **Minimum-universe guard** (`min_tradable=20`): When conformal gating removes too many stocks, re-admits the most confident ambiguous (set_size==2) stocks. This prevents the optimizer from concentrating into a dangerously small universe.
+2. **Adaptive position scaling**: When `n_active < 50`, `max_position` tightens from 5% toward `1/n_active`, preventing over-concentration in small universes.
+3. **Transaction cost model**: 5 bps/trade deducted from P&L proportional to turnover.
+
+**Root cause of MVO v1 failures**: The 9 negative-Sharpe folds all shared extreme conformal gating (avg 78.5%, up to 93%). The model signal was fine (naive L/S was +0.67 in those folds), but MVO concentrated into too few positions. After fixes, 7/9 flipped positive:
+
+| Fold | v1 Sharpe | v2 Sharpe | v1 Gated | v2 Gated |
+|:---:|:---:|:---:|:---:|:---:|
+| 4 | -0.35 | **+4.55** | 77.3% | 62.7% |
+| 33 | -1.47 | **+4.24** | 92.9% | 79.8% |
+| 40 | -1.27 | **+4.26** | 84.7% | 82.1% |
+| 47 | -4.54 | **+4.66** | 70.4% | 67.7% |
+| 71 | -0.78 | **+5.20** | 72.4% | 64.9% |
+| 77 | -3.84 | **+0.08** | 47.6% | 56.7% |
+| 86 | -2.53 | **+1.84** | 85.6% | 85.0% |
+
+### Regime Performance
+
+| Method | Calm (24f) | Normal (54f) | Crisis (12f) |
+|---|:---:|:---:|:---:|
+| MVO v2 | 4.00 | **5.23** | 4.56 |
+| Risk Parity | 3.42 | 3.69 | 1.80 |
+
+MVO v2 excels in normal and crisis markets. Risk Parity lags in crisis (Sharpe 1.80) due to higher turnover and cluster instability during stress periods.
+
+### Cross-Method Correlation
+
+| Pair | Sharpe Correlation |
+|---|:---:|
+| MVO v1 vs v2 | 0.324 |
+| MVO v1 vs RP | 0.193 |
+| **MVO v2 vs RP** | **0.042** |
+
+The near-zero correlation between MVO v2 and Risk Parity makes ensembling attractive. A hypothetical 50/50 blend projects 91.1% win rate with only 8 negative-Sharpe folds (vs 13 for MVO v2 alone).
+
+---
+
 ## Next Steps
 
 ### 🔴 Phase 0 — Remaining Deployment Items
 
-| # | Task | Rationale |
+| # | Task | Status |
 |---|---|---|
-| 0.1 | **Store raw L/S return series in `fold_results.json`** | Enables FF3 attribution for DGRCL itself (currently only computed for benchmarks) |
-| 0.2 | **Transaction Cost Analysis (TCA)** — integrate 5 bps/trade cost model | Verify edge survives execution; high-turnover daily rebalancing may erode alpha |
-| 0.3 | **Conformal abstention in live inference** — skip positions where `set_size = 2` | Reduces false confidence trades; conformal coverage is 89.4% vs target 90% |
+| 0.1 | **Store raw L/S return series in `fold_results.json`** | Pending |
+| 0.2 | ~~**Transaction Cost Analysis (TCA)**~~ | **✅ Complete** — 5 bps/trade integrated |
+| 0.3 | ~~**Conformal abstention in live inference**~~ | **✅ Complete** — `ConformalGate` with `min_tradable` guard |
 
-### 🟠 Phase 1 — Portfolio Construction (Short-Term)
+### ✅ Phase 1 — Portfolio Construction — Complete
 
-| # | Task | Rationale |
+| # | Task | Status |
 |---|---|---|
-| 1.1 | **Mean-Variance Optimizer** — feed `dir_logits` + `mag_preds` into a convex optimizer | Replaces naive top/bottom quintile with risk-efficient weights |
-| 1.2 | **Risk Parity via Graph Clusters** — use learned adjacency matrix to cluster correlated stocks | Allocates risk equally across clusters rather than individual stocks |
-| 1.3 | **Ensemble DGRCL + LightGBM** — blend scores from both models | The two models are partially uncorrelated; blending may improve Sharpe without retraining |
-| 1.4 | **MC Dropout median rank in production** | Mechanically improves rank stability; already implemented, needs pipeline integration |
+| 1.1 | ~~**Mean-Variance Optimizer**~~ | **✅ Complete** — MVO v2 (production candidate), Calmar 159.5 |
+| 1.2 | ~~**Risk Parity via Graph Clusters**~~ | **✅ Complete** — Total PnL 425.8, uncorrelated with MVO |
+| 1.3 | **MVO + Risk Parity ensemble** | Pending — r = 0.04 correlation makes blending high-value |
+| 1.4 | **MC Dropout median rank in production** | Pending |
 
 ### 🟡 Phase 2 — Alpha Expansion (Medium-Term)
 
@@ -107,7 +180,10 @@ Full benchmark analysis: see [`docs/benchmark_results.md`](benchmark_results.md)
 
 | File | Description |
 |---|---|
-| `backtest_results/fold_results.json` | Raw per-fold metrics (90 entries) |
+| `backtest_results/fold_results.json` | Raw per-fold metrics — base model (90 entries) |
+| `backtest_results/phase1_mvo_v2/fold_results.json` | Per-fold metrics — MVO v2 with TCA, min-universe guard |
+| `backtest_results/phase1_riskparity/fold_results.json` | Per-fold metrics — Risk Parity |
+| `backtest_results/phase1_mvo/fold_results.json` | Per-fold metrics — MVO v1 (superseded by v2) |
 | `backtest_results/backtest_summary.png` | Val loss + rank accuracy + magnitude MAE timeline |
 | `backtest_results/training_curve_fold_*.png` | Per-fold loss curves (all 90 folds) |
 | `backtest_results/attention_heatmap_fold_90.png` | Final fold macro-to-stock attention |

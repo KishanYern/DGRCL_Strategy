@@ -848,6 +848,193 @@ def compute_long_short_alpha(
     }
 
 
+def compute_optimized_alpha(
+    val_snapshots: List[Tuple],
+    model: MacroDGRCL,
+    device: torch.device,
+    sector_ids: Optional[torch.Tensor],
+    train_returns: torch.Tensor,         # [N_s, T_train] from training window
+    train_active_mask: Optional[torch.Tensor],  # [N_s] bool
+    corr_edge_index: Optional[torch.Tensor],
+    corr_edge_weight: Optional[torch.Tensor],
+    portfolio_method: str = "mvo",
+    gamma: float = 1.0,
+    alpha_conformal: float = 0.10,
+) -> Dict:
+    """
+    Phase 1 Portfolio Construction: optimized alpha computation.
+
+    Replaces / supplements the naive sector L/S in compute_long_short_alpha().
+    Runs the full PortfolioConstructor pipeline for each val snapshot:
+        ConformalGate -> ExpectedReturn -> Covariance -> MVO | RiskParity
+
+    Per-fold conformal calibration:
+        First half of val_snapshots → calibrate ConformalGate
+        Second half                 → compute optimized portfolio weights
+
+    Args:
+        val_snapshots:      List of 4-tuples (stock, macro, returns, active_mask)
+        model:              Trained MacroDGRCL (eval mode used internally)
+        device:             Torch device
+        sector_ids:         [N_s] int tensor of sector labels (for risk parity fallback)
+        train_returns:      [N_s, T_train] return series from training window
+        train_active_mask:  [N_s] active mask from last training snapshot
+        corr_edge_index:    Per-fold correlation edges [2, E]
+        corr_edge_weight:   Per-fold correlation weights [E]
+        portfolio_method:   "mvo" | "riskparity" | "naive"
+        gamma:              Risk aversion for MVO
+        alpha_conformal:    Conformal miscoverage level (default 0.10 = 90% coverage)
+
+    Returns:
+        Dict with portfolio metrics: sharpe, turnover_mean, max_drawdown,
+        total_pnl, n_snapshots, mean_gated_pct, mean_ls_alpha (for comparison)
+    """
+    from portfolio_optimizer import PortfolioConstructor, compute_portfolio_metrics
+
+    model.eval()
+
+    # --- Build PortfolioConstructor ---
+    constructor = PortfolioConstructor(
+        method=portfolio_method,
+        gamma=gamma,
+        use_conformal_gate=True,
+        alpha=alpha_conformal,
+    )
+
+    # Fit covariance from training window
+    if train_returns is not None and train_returns.numel() > 0:
+        active_np = train_active_mask.cpu().numpy() if train_active_mask is not None else None
+        constructor.fit_covariance(train_returns.cpu().numpy(), active_np)
+
+    # --- Per-fold conformal calibration on first half of val snapshots ---
+    n_val = len(val_snapshots)
+    cal_end = max(1, n_val // 2)   # First half for calibration
+    trade_start = cal_end           # Second half for trading
+
+    cal_logits_list: List[float] = []
+    cal_labels_list: List[float] = []
+
+    with torch.no_grad():
+        for snap in val_snapshots[:cal_end]:
+            if len(snap) == 4:
+                stock_feat, macro_feat, returns, active_mask = snap
+                active_mask = active_mask.to(device)
+            else:
+                stock_feat, macro_feat, returns = snap
+                active_mask = None
+
+            stock_feat = stock_feat.to(device)
+            macro_feat = macro_feat.to(device)
+            returns = returns.to(device)
+
+            logits_snap, _ = model(
+                stock_features=stock_feat,
+                macro_features=macro_feat,
+                active_mask=active_mask,
+                corr_edge_index=corr_edge_index,
+                corr_edge_weight=corr_edge_weight,
+            )
+            logits_np = logits_snap.squeeze(-1).cpu().numpy()
+            rets_np = returns.cpu().numpy()
+
+            mask_np = (
+                active_mask.cpu().numpy().astype(bool)
+                if active_mask is not None
+                else np.ones(len(logits_np), dtype=bool)
+            )
+            cal_logits_list.extend(logits_np[mask_np].tolist())
+            cal_labels_list.extend((rets_np[mask_np] > 0).astype(float).tolist())
+
+    if len(cal_logits_list) > 10:
+        constructor.fit_conformal(
+            np.array(cal_logits_list, dtype=np.float32),
+            np.array(cal_labels_list, dtype=np.float32),
+        )
+
+    # Prepare sector_ids numpy
+    sec_ids_np = sector_ids.cpu().numpy() if sector_ids is not None else None
+
+    # --- Trading: second half of val snapshots ---
+    weight_series: List[np.ndarray] = []
+    return_series: List[np.ndarray] = []
+    gated_pcts: List[float] = []
+    naive_spreads: List[float] = []   # naive L/S spread for comparison
+
+    with torch.no_grad():
+        for snap in val_snapshots[trade_start:]:
+            if len(snap) == 4:
+                stock_feat, macro_feat, returns, active_mask = snap
+                active_mask_dev = active_mask.to(device)
+            else:
+                stock_feat, macro_feat, returns = snap
+                active_mask_dev = None
+
+            stock_feat = stock_feat.to(device)
+            macro_feat = macro_feat.to(device)
+            returns_dev = returns.to(device)
+
+            dir_logits, mag_preds = model(
+                stock_features=stock_feat,
+                macro_features=macro_feat,
+                active_mask=active_mask_dev,
+                corr_edge_index=corr_edge_index,
+                corr_edge_weight=corr_edge_weight,
+            )
+
+            logits_np = dir_logits.squeeze(-1).cpu().numpy()
+            mag_np = mag_preds.squeeze(-1).cpu().numpy()
+            rets_np = returns_dev.cpu().numpy()
+            active_np = (
+                active_mask_dev.cpu().numpy().astype(bool)
+                if active_mask_dev is not None
+                else np.ones(len(logits_np), dtype=bool)
+            )
+
+            # Attention edges for risk-parity clustering (use correlation edges as proxy)
+            edge_idx_np = (
+                corr_edge_index.cpu().numpy()
+                if corr_edge_index is not None else None
+            )
+            edge_wt_np = (
+                corr_edge_weight.cpu().numpy()
+                if corr_edge_weight is not None else None
+            )
+
+            w, stats = constructor.construct(
+                dir_logits=logits_np,
+                mag_preds=mag_np,
+                active_mask=active_np,
+                edge_index=edge_idx_np,
+                edge_weights=edge_wt_np,
+                sector_ids=sec_ids_np,
+            )
+
+            weight_series.append(w)
+            return_series.append(rets_np)
+            gated_pcts.append(stats.get("gate", {}).get("gated_pct", 0.0))
+
+            # Naive L/S comparison (top 20% long, bottom 20% short)
+            active_idx = np.where(active_np)[0]
+            if len(active_idx) >= 4:
+                k = max(1, int(0.20 * len(active_idx)))
+                scores = logits_np[active_idx]
+                sorted_i = np.argsort(scores)
+                long_r = rets_np[active_idx[sorted_i[-k:]]].mean()
+                short_r = rets_np[active_idx[sorted_i[:k]]].mean()
+                naive_spreads.append(float(long_r - short_r))
+
+    model.train()
+
+    port_metrics = compute_portfolio_metrics(weight_series, return_series)
+    port_metrics["mean_gated_pct"] = float(np.mean(gated_pcts)) if gated_pcts else 0.0
+    port_metrics["mean_ls_alpha_naive"] = float(np.mean(naive_spreads)) if naive_spreads else 0.0
+    port_metrics["portfolio_method"] = portfolio_method
+    port_metrics["cal_samples"] = len(cal_logits_list)
+    port_metrics["trade_snapshots"] = len(weight_series)
+
+    return port_metrics
+
+
 def mc_dropout_inference(
     model: MacroDGRCL,
     stock_features: torch.Tensor,
@@ -1233,6 +1420,8 @@ def main(
     output_dir: str = "./backtest_results",
     epochs: int = 100,
     save_calibration_data: bool = False,
+    portfolio_method: str = "naive",
+    portfolio_gamma: float = 1.0,
 ):
     """
     Training loop with Multi-Task Learning.
@@ -1247,6 +1436,8 @@ def main(
         use_amp: If True, enable mixed precision (FP16) training for memory efficiency
         ablation: Feature ablation experiment name (one of ABLATION_CONFIGS keys)
         output_dir: Directory to save results
+        portfolio_method: Phase 1 portfolio strategy: "mvo" | "riskparity" | "naive"
+        portfolio_gamma: Risk aversion parameter for MVO (default 1.0)
     """
     # Hyperparameters
     STOCK_DIM_FULL = 8  # ['Close', 'High', 'Low', 'Log_Vol', 'RSI_14', 'MACD', 'Volatility_5', 'Returns']
@@ -1610,7 +1801,7 @@ def main(
                         (rets_snap[mask] > 0).float().tolist()
                     )
             
-            # Sector-balanced long-short alpha
+            # Sector-balanced long-short alpha (naive baseline, kept for comparison)
             ls_alpha = compute_long_short_alpha(
                 val_snapshots=val_data,
                 model=model,
@@ -1624,6 +1815,34 @@ def main(
                   f"mean/snap={ls_alpha['mean_ls_alpha']:.4f}, "
                   f"n_snaps={ls_alpha['n_snapshots']}")
 
+            # Phase 1: Optimized portfolio construction
+            # Collect training-window returns for covariance estimation.
+            # Stack the returns (index 2) from all training snapshots: [N_s, n_train].
+            train_rets_stacked = torch.stack(
+                [snap[2] for snap in train_data], dim=1
+            )  # [N_s, n_train]
+            last_train_active = train_data[-1][3] if len(train_data[-1]) == 4 else None
+
+            port_metrics = compute_optimized_alpha(
+                val_snapshots=val_data,
+                model=model,
+                device=device,
+                sector_ids=sector_ids,
+                train_returns=train_rets_stacked,
+                train_active_mask=last_train_active,
+                corr_edge_index=corr_edge_index,
+                corr_edge_weight=corr_edge_weight,
+                portfolio_method=portfolio_method,
+                gamma=portfolio_gamma,
+                alpha_conformal=0.10,
+            )
+            print(f"  Portfolio ({portfolio_method.upper()}): "
+                  f"Sharpe={port_metrics['sharpe']:.3f} (net={port_metrics.get('sharpe_net', port_metrics['sharpe']):.3f}), "
+                  f"Turnover={port_metrics['turnover_mean']:.4f}, "
+                  f"MaxDD={port_metrics['max_drawdown']:.4f}, "
+                  f"Cost={port_metrics.get('total_cost', 0):.4f}, "
+                  f"Gated={port_metrics['mean_gated_pct']*100:.1f}%")
+
             all_fold_results.append({
                 'fold': fold_idx + 1,
                 'train_loss': epoch_metrics['loss'],
@@ -1634,9 +1853,21 @@ def main(
                 'regime': regime_label,
                 'realized_vol': realized_vol,
                 'adaptive_lambda': adaptive_mag_weight,
-                # Persist long-short alpha
+                # Persist long-short alpha (naive baseline)
                 'ls_alpha_total': ls_alpha['total_ls_alpha'],
                 'ls_alpha_mean': ls_alpha['mean_ls_alpha'],
+                # Phase 1: optimized portfolio metrics (gross and net-of-cost)
+                'portfolio_method': portfolio_method,
+                'portfolio_sharpe': port_metrics['sharpe'],
+                'portfolio_sharpe_net': port_metrics.get('sharpe_net', port_metrics['sharpe']),
+                'portfolio_turnover': port_metrics['turnover_mean'],
+                'portfolio_max_drawdown': port_metrics['max_drawdown'],
+                'portfolio_max_drawdown_net': port_metrics.get('max_drawdown_net', port_metrics['max_drawdown']),
+                'portfolio_total_pnl': port_metrics['total_pnl'],
+                'portfolio_total_pnl_net': port_metrics.get('total_pnl_net', port_metrics['total_pnl']),
+                'portfolio_total_cost': port_metrics.get('total_cost', 0.0),
+                'portfolio_gated_pct': port_metrics['mean_gated_pct'],
+                'portfolio_naive_ls_alpha': port_metrics['mean_ls_alpha_naive'],
                 # Use actual splitter indices when available (real data 3-tuple folds);
                 # fall back to synthetic formula only if metadata is absent.
                 'train_start_idx': fold_meta.train_start if fold_meta is not None else fold_idx * FOLD_STEP,
@@ -1654,6 +1885,13 @@ def main(
                 'adaptive_lambda': adaptive_mag_weight,
                 'ls_alpha_total': None,
                 'ls_alpha_mean': None,
+                'portfolio_method': portfolio_method,
+                'portfolio_sharpe': None,
+                'portfolio_turnover': None,
+                'portfolio_max_drawdown': None,
+                'portfolio_total_pnl': None,
+                'portfolio_gated_pct': None,
+                'portfolio_naive_ls_alpha': None,
                 'train_start_idx': fold_meta.train_start if fold_meta is not None else fold_idx * FOLD_STEP,
                 'val_end_idx': fold_meta.val_end if fold_meta is not None else fold_idx * FOLD_STEP + TRAIN_SIZE + VAL_SIZE
             })
@@ -1688,6 +1926,35 @@ def main(
                    if r.get('regime') == rname and r.get('ls_alpha_mean') is not None]
         ls_str = f", avg L/S α={np.mean(ls_vals):.4f}" if ls_vals else ""
         print(f"  Regime '{rname}': {cnt} folds{ls_str}")
+
+    # Phase 1 Portfolio summary
+    sharpes = [r.get('portfolio_sharpe') for r in all_fold_results
+               if r.get('portfolio_sharpe') is not None
+               and not (isinstance(r.get('portfolio_sharpe'), float) and math.isnan(r['portfolio_sharpe']))]
+    if sharpes:
+        method_label = all_fold_results[-1].get('portfolio_method', 'unknown').upper()
+        print(f"\nPhase 1 Portfolio ({method_label}) Summary across {len(sharpes)} folds:")
+        print(f"  Avg Sharpe (gross): {np.mean(sharpes):.3f} ± {np.std(sharpes):.3f}")
+        sharpes_net = [r['portfolio_sharpe_net'] for r in all_fold_results
+                       if r.get('portfolio_sharpe_net') is not None
+                       and not math.isnan(r['portfolio_sharpe_net'])]
+        if sharpes_net:
+            print(f"  Avg Sharpe (net):   {np.mean(sharpes_net):.3f} ± {np.std(sharpes_net):.3f}")
+        turnovers = [r['portfolio_turnover'] for r in all_fold_results
+                     if r.get('portfolio_turnover') is not None]
+        if turnovers:
+            print(f"  Avg Turnover: {np.mean(turnovers):.5f}")
+        total_costs = [r.get('portfolio_total_cost', 0.0) for r in all_fold_results]
+        if any(c > 0 for c in total_costs):
+            print(f"  Total TCA Cost: {sum(total_costs):.4f}  (5 bps/trade)")
+        drawdowns = [r['portfolio_max_drawdown'] for r in all_fold_results
+                     if r.get('portfolio_max_drawdown') is not None]
+        if drawdowns:
+            print(f"  Avg Max DD:   {np.mean(drawdowns):.5f}")
+        gated = [r['portfolio_gated_pct'] for r in all_fold_results
+                 if r.get('portfolio_gated_pct') is not None]
+        if gated:
+            print(f"  Avg Gated:    {np.mean(gated)*100:.1f}%")
     
     # Save backtest summary visualization
     save_backtest_summary(all_fold_results, VIS_DIR, dates=dates if use_real_data else None)
@@ -1813,6 +2080,26 @@ if __name__ == "__main__":
         help="Save val-fold logits and labels for post-processing via confidence_calibration.py"
     )
 
+    parser.add_argument(
+        "--portfolio-method",
+        type=str,
+        default="naive",
+        choices=["mvo", "riskparity", "naive"],
+        help=(
+            "Phase 1 portfolio construction strategy (default: naive). "
+            "'naive' = top-20pct/bottom-20pct equal-weight L/S (baseline). "
+            "'mvo' = Markowitz MVO with Ledoit-Wolf covariance (requires cvxpy). "
+            "'riskparity' = Equal-risk-contribution across graph clusters (requires scipy, scikit-learn)."
+        )
+    )
+
+    parser.add_argument(
+        "--portfolio-gamma",
+        type=float,
+        default=1.0,
+        help="Risk aversion coefficient for MVO portfolio (default: 1.0, higher = more conservative)"
+    )
+
     args = parser.parse_args()
     main(
         use_real_data=args.real_data,
@@ -1824,4 +2111,6 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         epochs=args.epochs,
         save_calibration_data=args.save_calibration_data,
+        portfolio_method=args.portfolio_method,
+        portfolio_gamma=args.portfolio_gamma,
     )

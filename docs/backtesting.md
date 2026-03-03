@@ -1,5 +1,5 @@
 # Backtesting & Metrics
-*Last updated: 2026-03-01 — reflects v1.6 90-fold walk-forward run (2007–2026)*
+*Last updated: 2026-03-03 — reflects v1.7 Phase 1 Portfolio Construction (2007–2026)*
 
 ## 1. Walk-Forward Validation
 
@@ -81,7 +81,62 @@ Regime, realized_vol, and adaptive_lambda are persisted per fold in `fold_result
 
 The v1.6 interventions completely eliminated the NaN cascade problem. Even during extreme volatility spikes (GFC, COVID), the model remained 100% stable in all 90 out-of-sample walk-forward folds.
 
-## 6. Running the Full Pipeline
+## 6. Phase 1: Portfolio Construction (v1.7)
+
+Phase 1 replaces the naive sector L/S baseline with optimized portfolio weights derived from model outputs. Three strategies are available, all sharing a common pre-processing pipeline:
+
+```
+MacroDGRCL outputs → ConformalGate (abstention) → ExpectedReturn (μ) → Covariance (Σ) → Optimizer → weights w
+```
+
+### Strategies
+
+| Strategy | `--portfolio-method` | Description |
+|---|---|---|
+| **MVO** | `mvo` | Markowitz Mean-Variance via cvxpy. Dollar-neutral, gross leverage ≤ 2.0, adaptive per-stock caps. |
+| **Risk Parity** | `riskparity` | Equal-risk-contribution across spectral clusters from the attention graph. |
+| **Naive L/S** | `naive` | Baseline: top-20%/bottom-20% equal-weight long-short (no optimizer). |
+
+### Portfolio Metrics
+
+| Metric | Description |
+|---|---|
+| **Sharpe (gross)** | Annualized Sharpe on raw P&L (5-day horizon, 252/5 periods/year) |
+| **Sharpe (net)** | Sharpe after 5 bps/trade TCA deduction |
+| **Turnover** | Mean absolute weight change between consecutive snapshots |
+| **MaxDD** | Maximum drawdown on cumulative P&L within a fold |
+| **Calmar** | Total PnL / worst single-fold max drawdown |
+| **Gated %** | Fraction of active stocks removed by conformal abstention |
+| **TCA Cost** | Cumulative transaction cost at 5 bps per unit of turnover |
+
+### Conformal Abstention Gate
+
+Per-fold calibration on the first half of validation snapshots, applied to the second half:
+- `set_size == 1` → trade (model assigns exactly one direction)
+- `set_size == 0` → abstain (model rejects both directions)
+- `set_size == 2` → abstain (model is ambiguous)
+
+**Minimum-universe guard**: If gating leaves fewer than `min_tradable=20` stocks, the most confident ambiguous stocks are progressively re-admitted to prevent dangerous optimizer concentration.
+
+### Running Portfolio Backtests
+
+```bash
+# MVO (recommended — production candidate):
+python3 train.py --real-data --epochs 100 --portfolio-method mvo \
+    --output-dir ./backtest_results/phase1_mvo_v2
+
+# Risk Parity:
+python3 train.py --real-data --epochs 100 --portfolio-method riskparity \
+    --output-dir ./backtest_results/phase1_riskparity
+
+# Naive L/S baseline:
+python3 train.py --real-data --epochs 100 --portfolio-method naive \
+    --output-dir ./backtest_results/phase1_naive
+```
+
+---
+
+## 7. Running the Base Pipeline
 
 ```bash
 # AMD GPU (recommended):
@@ -94,7 +149,7 @@ python3 confidence_calibration.py --results-dir ./backtest_results
 
 ---
 
-## 7. Benchmark Comparison
+## 8. Benchmark Comparison
 
 After training, run the benchmark suite to compare DGRCL against a tiered set of baseline models on the same 90 folds:
 
