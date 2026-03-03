@@ -1,0 +1,23 @@
+[
+  {
+    "fold": 1,
+    "train_loss": 0.5050992494957014,
+    "val_loss": null,
+    "rank_accuracy": 0.5000299868935888,
+    "mag_mae": 0.3579909456047145,
+    "regime": "calm",
+    "realized_vol": 0.003172740410245676,
+    "adaptive_lambda": 0.06666666666666668,
+    "ls_alpha_total": null,
+    "ls_alpha_mean": null,
+    "portfolio_method": "mvo",
+    "portfolio_sharpe": null,
+    "portfolio_turnover": null,
+    "portfolio_max_drawdown": null,
+    "portfolio_total_pnl": null,
+    "portfolio_gated_pct": null,
+    "portfolio_naive_ls_alpha": null,
+    "train_start_idx": 0,
+    "val_end_idx": 300
+  }
+]
