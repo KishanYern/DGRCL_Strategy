@@ -185,10 +185,10 @@ class MeanVarianceOptimizer:
 
     Problem:
         maximize   w^T mu - (gamma/2) w^T Sigma w
-        subject to sum(w) = 0          (dollar neutral)
-                   ||w||_1 <= 2.0      (gross leverage cap)
-                   |w_i| <= max_pos    (per-stock position limit)
-                   w[~active] = 0      (no-trade mask)
+        subject to sum(w) = net_exposure  (directional tilt, 0 = dollar neutral)
+                   ||w||_1 <= max_lev     (gross leverage cap)
+                   |w_i| <= max_pos       (per-stock position limit)
+                   w[~active] = 0         (no-trade mask)
 
     Returns the optimal weight vector w [N].
     """
@@ -198,16 +198,25 @@ class MeanVarianceOptimizer:
         gamma: float = 1.0,
         max_leverage: float = 2.0,
         max_position: float = 0.05,
+        net_exposure: float = 0.0,
+        turnover_penalty: float = 0.001,
     ):
         self.gamma = gamma
         self.max_leverage = max_leverage
         self.max_position = max_position
+        self.net_exposure = net_exposure
+        # Penalise each unit of |w - w_prev| by this fraction of expected
+        # return. At 0.001, holding a position costs 0.1% per unit per
+        # rebalance — comparable to one round-trip transaction cost — which
+        # meaningfully discourages unnecessary churn without over-constraining.
+        self.turnover_penalty = turnover_penalty
 
     def optimize(
         self,
-        mu: np.ndarray,          # [N] expected returns
-        sigma: np.ndarray,       # [N, N] covariance matrix
-        active_mask: np.ndarray, # [N] bool
+        mu: np.ndarray,                        # [N] expected returns
+        sigma: np.ndarray,                     # [N, N] covariance matrix
+        active_mask: np.ndarray,               # [N] bool
+        prev_weights: Optional[np.ndarray] = None,  # [N] previous weights
     ) -> np.ndarray:
         """
         Returns:
@@ -242,6 +251,12 @@ class MeanVarianceOptimizer:
         mu_a = mu[active_idx]
         sig_a = sigma[np.ix_(active_idx, active_idx)]
 
+        # Previous weights on the active sub-set (zeros if no prior position)
+        if prev_weights is not None and len(prev_weights) == N:
+            prev_a = prev_weights[active_idx].astype(np.float64)
+        else:
+            prev_a = np.zeros(n_active, dtype=np.float64)
+
         # Ensure PSD for cvxpy
         sig_a = 0.5 * (sig_a + sig_a.T)
         min_eig = np.linalg.eigvalsh(sig_a).min()
@@ -251,10 +266,12 @@ class MeanVarianceOptimizer:
         w_a = cp.Variable(n_active)
 
         objective = cp.Maximize(
-            mu_a @ w_a - (self.gamma / 2.0) * cp.quad_form(w_a, sig_a)
+            mu_a @ w_a
+            - (self.gamma / 2.0) * cp.quad_form(w_a, sig_a)
+            - self.turnover_penalty * cp.norm1(w_a - prev_a)
         )
         constraints = [
-            cp.sum(w_a) == 0,                        # dollar neutral
+            cp.sum(w_a) == self.net_exposure,          # net exposure tilt
             cp.norm1(w_a) <= self.max_leverage,       # gross leverage
             w_a >= -effective_max_pos,                # short limit (adaptive)
             w_a <= effective_max_pos,                 # long limit (adaptive)
@@ -884,6 +901,7 @@ class PortfolioConstructor:
         edge_index: Optional[np.ndarray] = None,   # [2, E] attention edges (risk parity)
         edge_weights: Optional[np.ndarray] = None, # [E] attention weights (risk parity)
         sector_ids: Optional[np.ndarray] = None,   # [N] int sector labels (fallback)
+        prev_weights: Optional[np.ndarray] = None, # [N] previous portfolio weights
     ) -> Tuple[np.ndarray, Dict]:
         """
         Run the full pipeline for one snapshot and return portfolio weights.
@@ -918,7 +936,8 @@ class PortfolioConstructor:
                 w = self._naive_ls(mu, trade_mask)
                 stats["fallback"] = "cov_not_fitted"
             else:
-                w = self._mvo.optimize(mu, self._cov_estimator.sigma, trade_mask)
+                w = self._mvo.optimize(mu, self._cov_estimator.sigma, trade_mask,
+                                       prev_weights=prev_weights)
 
         elif self.method == "riskparity":
             if not self._cov_fitted:

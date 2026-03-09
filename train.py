@@ -2100,7 +2100,11 @@ def main(
         last_regime = all_fold_results[-1].get('regime') if all_fold_results else None
         last_vol = all_fold_results[-1].get('realized_vol') if all_fold_results else None
         last_fold_num = all_fold_results[-1].get('fold') if all_fold_results else None
-        train_end_str = str(dates[folds[-1].val_end - 1].date()) if (use_real_data and folds) else None
+        if use_real_data and folds:
+            last_fold_meta = folds[-1][2] if len(folds[-1]) == 3 else None
+            train_end_str = str(dates[last_fold_meta.val_end - 1].date()) if last_fold_meta is not None else None
+        else:
+            train_end_str = None
 
         metadata = {
             "tickers": tickers if use_real_data else [],
